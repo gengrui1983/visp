@@ -10,6 +10,7 @@ pub mod prompt;
 pub mod provider;
 pub mod provider_metadata;
 pub mod rules;
+pub mod sanitize;
 pub mod session;
 pub mod skill;
 pub mod tool;

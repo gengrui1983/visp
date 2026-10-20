@@ -1226,7 +1226,7 @@ fn byte_stream_to_chat_events_with_mode(
                         // Langfuse generation capture: record output if enabled
                         let raw_output_len = state.accumulated_output.len();
                         if state.langfuse_capture_output && raw_output_len > 0 {
-                            let sanitized = crate::sanitize::format_langfuse_output(
+                            let sanitized = visp_core::sanitize::format_langfuse_output(
                                 &state.accumulated_output,
                                 state.langfuse_capture_max_chars,
                                 state.langfuse_redact_secrets,
@@ -1596,7 +1596,7 @@ impl LlmProvider for OpenAiProvider {
         if config.langfuse_capture_input {
             // Record only the messages array, not the full request body
             let input = body.get("messages").unwrap_or(&body);
-            let sanitized = crate::sanitize::format_langfuse_input(
+            let sanitized = visp_core::sanitize::format_langfuse_input(
                 input,
                 config.langfuse_capture_max_chars,
                 config.langfuse_redact_secrets,
@@ -1606,7 +1606,7 @@ impl LlmProvider for OpenAiProvider {
             // Record tools as a separate attribute
             if let Some(tools_val) = body.get("tools") {
                 let tools_str = serde_json::to_string(tools_val).unwrap_or_default();
-                let tools_sanitized = crate::sanitize::sanitize_and_truncate(
+                let tools_sanitized = visp_core::sanitize::sanitize_and_truncate(
                     &tools_str,
                     config.langfuse_capture_max_chars,
                     config.langfuse_redact_secrets,

@@ -145,6 +145,46 @@ async fn send_event(
     Ok(())
 }
 
+/// 统一的 agent-loop span 初始化宏（tool / run / iteration 三类 span 共用同一展开）。
+///
+/// - 行为：创建 span，`tracing` 字段语法的立即字段原样透传给 `info_span!`；`langfuse_enabled` 守卫内记录 `langfuse.observation.type="span"` 并调用 `record_langfuse_trace_fields` 进行 langfuse 传播。
+/// - 固定字段集（三类并集）：公共具体值 `session_id`/`session.id`（取自 `$sid`）；延后 record 的 Empty 槽 `trace_id`/`parent_span_id`（ParentLinkLayer on_enter）、全部 `langfuse.*`、`level`/`status_message`/`visp.tool.*`。
+/// - 约束：调用方立即字段不得与上述集合重名（重名 = 同一 callsite 重复声明）；对未声明字段调用 `record()` 会被静默丢弃。
+macro_rules! init_span {
+    ($cfg:expr, $sid:expr, $span_name:literal, $($field:tt)*) => {{
+        let __span = tracing::info_span!(
+            $span_name,
+            session_id = $sid,
+            session.id = $sid,
+            langfuse.session.id = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+            langfuse.observation.type = tracing::field::Empty,
+            langfuse.observation.input = tracing::field::Empty,
+            langfuse.observation.output = tracing::field::Empty,
+            langfuse.user.id = tracing::field::Empty,
+            langfuse.trace.tags = tracing::field::Empty,
+            langfuse.trace.name = tracing::field::Empty,
+            langfuse.environment = tracing::field::Empty,
+            langfuse.trace.public = tracing::field::Empty,
+            langfuse.release = tracing::field::Empty,
+            langfuse.version = tracing::field::Empty,
+            langfuse.trace.metadata = tracing::field::Empty,
+            level = tracing::field::Empty,
+            status_message = tracing::field::Empty,
+            visp.tool.is_error = tracing::field::Empty,
+            visp.tool.duration_ms = tracing::field::Empty,
+            visp.tool.arguments = tracing::field::Empty,
+            $($field)*
+        );
+        if $cfg.langfuse_enabled {
+            __span.record("langfuse.observation.type", "span");
+        }
+        $crate::agent_loop::record_langfuse_trace_fields(&__span, $cfg, $sid);
+        __span
+    }};
+}
+
 /// Record langfuse trace-level fields onto a span.
 /// The span must have these fields declared in its `info_span!` macro invocation.
 /// Safe to call even when langfuse is disabled (returns immediately).
@@ -1197,42 +1237,16 @@ async fn execute_tool_calls(
         // Pre-clone for tool span
         let tool_span_name = tc.name.clone();
         let tool_span_id = tc.id.clone();
-        let tool_span = if langfuse_enabled {
-            tracing::info_span!(
-                "visp.tool.execute",
-                gen_ai.tool.name = %tool_span_name,
-                gen_ai.tool.call.id = %tool_span_id,
-                gen_ai.tool.type = "function",
-                gen_ai.operation.name = "execute_tool",
-                langfuse.observation.type = "span",
-                level = tracing::field::Empty,
-                status_message = tracing::field::Empty,
-                langfuse.session.id = tracing::field::Empty,
-                langfuse.user.id = tracing::field::Empty,
-                langfuse.trace.tags = tracing::field::Empty,
-                langfuse.trace.name = tracing::field::Empty,
-                langfuse.environment = tracing::field::Empty,
-                langfuse.trace.public = tracing::field::Empty,
-                langfuse.release = tracing::field::Empty,
-                langfuse.version = tracing::field::Empty,
-                langfuse.trace.metadata = tracing::field::Empty,
-                visp.tool.is_error = tracing::field::Empty,
-                visp.tool.duration_ms = tracing::field::Empty,
-                visp.tool.arguments = tracing::field::Empty,
-            )
-        } else {
-            tracing::info_span!(
-                "visp.tool.execute",
-                gen_ai.tool.name = %tool_span_name,
-                gen_ai.tool.call.id = %tool_span_id,
-                gen_ai.tool.type = "function",
-                visp.tool.is_error = tracing::field::Empty,
-                visp.tool.duration_ms = tracing::field::Empty,
-                visp.tool.arguments = tracing::field::Empty,
-            )
-        };
-        // Propagate langfuse trace-level fields onto tool span
-        record_langfuse_trace_fields(&tool_span, cfg, sid);
+
+        let tool_span = init_span!(
+            cfg,
+            sid,
+            "visp.tool.execute",
+            gen_ai.tool.name = %tool_span_name,
+            gen_ai.tool.call.id = %tool_span_id,
+            gen_ai.tool.type = "function",
+            gen_ai.operation.name = "execute_tool",
+        );
 
         tracing::info!(
             tool_name = %tc.name,
@@ -1643,51 +1657,29 @@ pub async fn run_agent_loop(
         .unwrap_or("unknown")
         .to_string();
 
-    let __run_span = if agent_config.langfuse_enabled {
-        let trace_name = "visp.agent.run".to_string();
-        tracing::info_span!(
-            "visp.agent.run",
-            session.id = %ctx.session_id,
-            session.short_id = %short_id,
-            gen_ai.provider.name = %provider_name,
-            langfuse.session.id = %ctx.session_id,
-            langfuse.trace.name = %trace_name,
-            langfuse.user.id = tracing::field::Empty,
-            langfuse.trace.tags = tracing::field::Empty,
-            langfuse.environment = tracing::field::Empty,
-            langfuse.trace.public = tracing::field::Empty,
-            langfuse.release = tracing::field::Empty,
-            langfuse.version = tracing::field::Empty,
-            langfuse.trace.metadata = tracing::field::Empty,
-            visp.agent.kind = %ctx.agent_kind,
-            visp.agent.depth = ctx.depth,
-            visp.agent.parent_session_id = %ctx.parent_session_id,
-            langfuse.observation.type = tracing::field::Empty,
-            langfuse.observation.input = tracing::field::Empty,
-            langfuse.observation.output = tracing::field::Empty,
-            visp.span.w3c_id = tracing::field::Empty,
-            trace_id = tracing::field::Empty,
-            parent_span_id = tracing::field::Empty,
-        )
-    } else {
-        tracing::info_span!(
-            "visp.agent.run",
-            session.id = %ctx.session_id,
-            session.short_id = %short_id,
-            gen_ai.provider.name = %provider_name,
-            visp.agent.kind = %ctx.agent_kind,
-            visp.agent.depth = ctx.depth,
-            visp.agent.parent_session_id = %ctx.parent_session_id,
-            visp.span.w3c_id = tracing::field::Empty,
-            trace_id = tracing::field::Empty,
-            parent_span_id = tracing::field::Empty,
-        )
-    };
+    let cfg = agent_config.clone();
+    let sid = ctx.session_id.clone();
+
+    // Generate W3C span ID for this run span and record as field.
+    // A downstream layer (SpanW3CIdInjector or ParentLinkLayer) reads this
+    // via on_record and writes it into the span extension.
+    let run_span_w3c_id = generate_w3c_span_id();
+
+    let __run_span = init_span!(
+        &cfg,
+        &sid,
+        "visp.agent.run",
+        session.short_id = %short_id,
+        gen_ai.provider.name = %provider_name,
+        visp.agent.kind = %ctx.agent_kind,
+        visp.agent.depth = ctx.depth,
+        visp.agent.parent_session_id = %ctx.parent_session_id,
+        visp.span.w3c_id = &run_span_w3c_id,
+    );
+
     let __run_guard = __run_span.enter();
 
-    let sid = ctx.session_id.clone();
     let sm = session_mgr.clone();
-    let cfg = agent_config.clone();
 
     // Clone for use in panic handler after the async block
     let sid_panic = sid.clone();
@@ -1698,58 +1690,18 @@ pub async fn run_agent_loop(
 
     // Generate trace_id for W3C TraceContext propagation (Wave 1)
     let visp_trace_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    // Generate W3C span ID for this run span and record as field.
-    // A downstream layer (SpanW3CIdInjector or ParentLinkLayer) reads this
-    // via on_record and writes it into the span extension.
-    let run_span_w3c_id = generate_w3c_span_id();
-    __run_span.record("visp.span.w3c_id", &run_span_w3c_id);
 
     // Record optional langfuse fields based on config
-    if agent_config.langfuse_enabled {
-        if let Some(ref user_id) = agent_config.langfuse_user_id {
-            __run_span.record("langfuse.user.id", user_id.as_str());
-        }
-        if let Some(ref tags) = agent_config.langfuse_tags {
-            __run_span.record("langfuse.trace.tags", tags.as_str());
-        }
-        if let Some(ref env) = agent_config.langfuse_environment {
-            __run_span.record("langfuse.environment", env.as_str());
-        }
-        if let Some(ref release) = agent_config.langfuse_release {
-            __run_span.record("langfuse.release", release.as_str());
-        }
-        if let Some(ref version) = agent_config.langfuse_version {
-            __run_span.record("langfuse.version", version.as_str());
-        }
-        if let Some(public) = agent_config.langfuse_public {
-            __run_span.record("langfuse.trace.public", public);
-        }
-        if let Some(ref metadata) = agent_config.langfuse_metadata
-            && !metadata.is_empty()
-            && let Ok(json) = serde_json::to_string(metadata)
-        {
-            __run_span.record("langfuse.trace.metadata", json.as_str());
-        }
+    if agent_config.langfuse_enabled && cfg.langfuse_capture_input {
+        __run_span.record("langfuse.observation.type", "span");
 
-        // Record langfuse observation input (for trace preview)
-        if agent_config.langfuse_capture_input {
-            __run_span.record("langfuse.observation.type", "span");
-            let input_json = serde_json::json!({"message": user_message.content});
-            let input_str = input_json.to_string();
-            let max_chars = agent_config.langfuse_capture_max_chars;
-            let truncated = if input_str.len() > max_chars {
-                let mut end = max_chars.saturating_sub(14);
-                while end > 0 && !input_str.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let mut s = input_str[..end].to_string();
-                s.push_str("...[truncated]");
-                s
-            } else {
-                input_str
-            };
-            __run_span.record("langfuse.observation.input", &truncated);
-        }
+        let json = serde_json::json!({"message": &user_message.content});
+        let truncated = crate::sanitize::format_langfuse_input(
+            &json,
+            agent_config.langfuse_capture_max_chars,
+            agent_config.langfuse_redact_secrets,
+        );
+        __run_span.record("langfuse.observation.input", &truncated);
     }
 
     // Clone root span handle for use inside async body (for output recording)
@@ -1820,31 +1772,13 @@ pub async fn run_agent_loop(
             );
             // Create iteration span with W3C ID placeholder.
             let iter_span_w3c_id = generate_w3c_span_id();
-            let iteration_span = if agent_config.langfuse_enabled {
-                tracing::info_span!(
-                    "visp.agent.iteration",
-                    visp.span.w3c_id = tracing::field::Empty,
-                    iteration.count = iteration,
-                    langfuse.session.id = tracing::field::Empty,
-                    langfuse.user.id = tracing::field::Empty,
-                    langfuse.trace.tags = tracing::field::Empty,
-                    langfuse.trace.name = tracing::field::Empty,
-                    langfuse.environment = tracing::field::Empty,
-                    langfuse.trace.public = tracing::field::Empty,
-                    langfuse.release = tracing::field::Empty,
-                    langfuse.version = tracing::field::Empty,
-                    langfuse.trace.metadata = tracing::field::Empty,
-                )
-            } else {
-                tracing::info_span!(
-                    "visp.agent.iteration",
-                    visp.span.w3c_id = tracing::field::Empty,
-                    iteration.count = iteration,
-                )
-            };
-            iteration_span.record("visp.span.w3c_id", &iter_span_w3c_id);
-            // Propagate langfuse trace-level fields onto iteration span
-            record_langfuse_trace_fields(&iteration_span, &cfg, &sid);
+            let iteration_span = init_span!(
+                &cfg,
+                &sid,
+                "visp.agent.iteration",
+                visp.span.w3c_id = &iter_span_w3c_id,
+                iteration.count = iteration,
+            );
 
             // a/b/c: Build prompt + boundary checks
             let ic = match setup_iteration(
@@ -1944,20 +1878,13 @@ pub async fn run_agent_loop(
                         && !output.text_buffer.is_empty()
                     {
                         root_span.record("langfuse.observation.type", "span");
-                        let output_json = serde_json::json!({"response": output.text_buffer});
-                        let output_str = output_json.to_string();
-                        let max_chars = cfg.langfuse_capture_max_chars;
-                        let truncated = if output_str.len() > max_chars {
-                            let mut end = max_chars.saturating_sub(14);
-                            while end > 0 && !output_str.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            let mut s = output_str[..end].to_string();
-                            s.push_str("...[truncated]");
-                            s
-                        } else {
-                            output_str
-                        };
+
+                        let json = serde_json::json!({"response": &output.text_buffer});
+                        let truncated = crate::sanitize::format_langfuse_input(
+                            &json,
+                            cfg.langfuse_capture_max_chars,
+                            cfg.langfuse_redact_secrets,
+                        );
                         root_span.record("langfuse.observation.output", &truncated);
                     }
 
