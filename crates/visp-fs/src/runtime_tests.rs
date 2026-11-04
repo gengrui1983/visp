@@ -584,6 +584,34 @@ fn root_level_mount_failure_reports_degradation_with_bounded_retry() {
     assert!(core.reconcile().is_empty());
 }
 
+/// fd 泄漏兜底：根存在但初始挂载失败 ⇒ 启动阶段须识别并放弃该 watcher。
+#[test]
+fn existing_root_with_failed_initial_mount_is_reported() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let target = recursive(&root, vec![], &[]);
+    let mut core = fake_core(vec![target], [root.clone()].into_iter().collect());
+    core.backend.fail_watch.insert(root.clone());
+
+    let _ = core.reconcile();
+    assert_eq!(core.failed_initial_roots(), vec![root]);
+}
+
+/// G5 延迟挂载设计不受影响：根不存在时不算初始挂载失败。
+#[test]
+fn missing_root_is_not_an_initial_mount_failure() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("watched");
+    let target = recursive(&missing, vec![], &[]);
+    let mut core = fake_core(
+        vec![target],
+        [dir.path().to_path_buf()].into_iter().collect(),
+    );
+
+    let _ = core.reconcile();
+    assert!(core.failed_initial_roots().is_empty());
+}
+
 /// 2b#5 细则 5：无任何可挂载祖先 → 终止并上报「不可挂载」。
 #[test]
 fn unmountable_target_reports_once_and_does_not_mount() {

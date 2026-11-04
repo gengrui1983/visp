@@ -106,6 +106,77 @@ pub(crate) trait MountBackend {
     fn unwatch(&mut self, path: &Path, kind: MountKind) -> Result<(), notify::Error>;
 }
 
+/// 事件路径别名：将后端报告的 canonical 路径还原为调用方使用的原始拼写。
+///
+/// macOS fsevent 通过 realpath 报告事件（例如 `/var/folders/...` 会变成
+/// `/private/var/folders/...`），而目标与已索引路径使用调用方传入的拼写；
+/// 若不还原，`WatchTarget::matches` 与 `strip_prefix` 会全部失配。
+#[derive(Debug, Default)]
+struct PathAliases {
+    /// (canonical 前缀, 原始前缀)，按 canonical 前缀长度降序。
+    entries: Vec<(PathBuf, PathBuf)>,
+}
+
+impl PathAliases {
+    /// 为每个目标根（或其最近存在祖先）登记 canonical → 原始映射。
+    fn for_targets(targets: &[WatchTarget]) -> Self {
+        let mut aliases = Self::default();
+        for target in targets {
+            aliases.add(&target.root);
+        }
+        aliases
+            .entries
+            .sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+        aliases
+    }
+
+    /// 为根或最近存在祖先登记映射；根尚未创建时仍可覆盖后续出现的事件。
+    fn add(&mut self, path: &Path) {
+        let mut current = Some(path);
+        while let Some(candidate) = current {
+            if let Ok(canonical) = candidate.canonicalize() {
+                if canonical != candidate
+                    && !self
+                        .entries
+                        .iter()
+                        .any(|(existing, _)| existing == &canonical)
+                {
+                    self.entries.push((canonical, candidate.to_path_buf()));
+                }
+                return;
+            }
+            current = candidate.parent();
+        }
+    }
+
+    /// 若 `path` 位于某 canonical 前缀下，则按对应原始前缀重建路径。
+    fn restore(&self, path: &Path) -> PathBuf {
+        for (canonical, original) in &self.entries {
+            if let Ok(rest) = path.strip_prefix(canonical) {
+                return original.join(rest);
+            }
+        }
+        path.to_path_buf()
+    }
+}
+
+impl RawEvent {
+    /// 把事件中所有路径还原为调用方拼写（fsevent canonical 路径兼容）。
+    fn restore(self, aliases: &PathAliases) -> Self {
+        match self {
+            RawEvent::Create(path) => RawEvent::Create(aliases.restore(&path)),
+            RawEvent::Modify(path) => RawEvent::Modify(aliases.restore(&path)),
+            RawEvent::Remove(path) => RawEvent::Remove(aliases.restore(&path)),
+            RawEvent::RenameFrom(path) => RawEvent::RenameFrom(aliases.restore(&path)),
+            RawEvent::RenameTo(path) => RawEvent::RenameTo(aliases.restore(&path)),
+            RawEvent::RenameBoth { from, to } => RawEvent::RenameBoth {
+                from: aliases.restore(&from),
+                to: aliases.restore(&to),
+            },
+        }
+    }
+}
+
 /// `notify::Event` → 自定义 [`RawEvent`] 的适配（备注 13）。
 ///
 /// 后端差异集中于此：
@@ -267,6 +338,14 @@ impl<B: MountBackend, E: Fn(&Path) -> bool> Core<B, E> {
     /// 处理单个后端原始事件：细则 2a 探测 + 归一化 + 必要重挂 + 过滤投递。
     fn process(&mut self, raw: RawEvent) -> Vec<WatchMessage> {
         let mut messages = Vec::new();
+
+        // macOS fsevent 的 `RenameMode::Any` 无法区分旧/新名：重命名会先后报告
+        // 两个单路径事件（旧名、新名），且都归为 `RenameFrom`。旧名此时已不存在，
+        // 而新名仍存在；按存在性把后者还原为 `RenameTo`，否则新文件会被误判为删除。
+        let raw = match raw {
+            RawEvent::RenameFrom(path) if (self.exists)(&path) => RawEvent::RenameTo(path),
+            other => other,
+        };
 
         // 细则 2a（必需主路径）：Remove 命中**仍存在**的路径 ⇒ 覆盖同名已监听路径的
         // 原子替换（tmp+rename）⇒ 立即重挂 + 投递「创建」。kqueue 的目录 diff 不会
@@ -450,6 +529,19 @@ impl<B: MountBackend, E: Fn(&Path) -> bool> Core<B, E> {
         messages
     }
 
+    /// 初始 reconcile 之后仍「根存在但未挂载」的目标根。
+    ///
+    /// kqueue 递归挂载中途失败（EMFILE / 权限）时，notify 会把已打开的 fd 留在
+    /// watcher 内部；若静默返回半成品 watcher，这些 fd 将永久泄漏。启动阶段据此
+    /// 判定是否需要放弃并销毁 watcher。
+    fn failed_initial_roots(&self) -> Vec<PathBuf> {
+        self.targets
+            .iter()
+            .filter(|target| (self.exists)(&target.root) && !self.dirs.contains_key(&target.root))
+            .map(|target| target.root.clone())
+            .collect()
+    }
+
     /// 有界重试挂载目录（细则 5）；返回最终尝试次数作为 `Err`。
     fn mount_dir_with_retry(&mut self, path: &Path, kind: MountKind) -> Result<(), usize> {
         for attempt in 0..MAX_MOUNT_ATTEMPTS {
@@ -545,6 +637,8 @@ impl FsWatcher {
 pub async fn start(
     targets: Vec<WatchTarget>,
 ) -> Result<(FsWatcher, UnboundedReceiver<WatchMessage>), notify::Error> {
+    // fsevent 以 realpath 报告事件；提前记录 canonical → 原始拼写映射。
+    let aliases = PathAliases::for_targets(&targets);
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<NotifyEvent>();
     let watcher = notify::recommended_watcher(
         move |result: Result<NotifyEvent, notify::Error>| match result {
@@ -570,7 +664,18 @@ pub async fn start(
 
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<WatchMessage>();
     // 启动时一次性挂载（同步完成，先于任何事件）。
-    for message in core.reconcile() {
+    let initial_messages = core.reconcile();
+    if let Some(root) = core.failed_initial_roots().into_iter().next() {
+        // 根存在却挂载失败（典型：EMFILE）。notify 可能已在 watcher 内留下部分 fd；
+        // 立即销毁核心与 watcher（释放全部 fd），绝不返回半成品监听器。
+        drop(core);
+        drop(watcher);
+        return Err(notify::Error::new(notify::ErrorKind::Generic(format!(
+            "initial mount failed for {} (resource exhausted?); watcher released to avoid fd leak",
+            root.display()
+        ))));
+    }
+    for message in initial_messages {
         let _ = out_tx.send(message);
     }
     core.initialized = true;
@@ -588,7 +693,7 @@ pub async fn start(
                     }
                     let mut messages: Vec<WatchMessage> = Vec::new();
                     for raw in adapt(&event) {
-                        messages.extend(core.process(raw));
+                        messages.extend(core.process(raw.restore(&aliases)));
                     }
                     messages.extend(core.reconcile());
                     for message in messages {

@@ -87,6 +87,34 @@ fn test_full_build_excludes_dirs() {
 }
 
 #[test]
+fn test_collect_files_excludes_heavy_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_file(&project, "node_modules/foo.ts", "export function a() {}\n");
+    write_file(&project, "target/gen.ts", "export function b() {}\n");
+    write_file(&project, "src/a.ts", "export function c() {}\n");
+
+    let files = collect_files(&project, &CodeGraphConfig::default()).unwrap();
+    let rel: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&project)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(rel, vec!["src/a.ts".to_string()]);
+}
+
+#[test]
+fn test_default_config_excludes_heavy_dirs() {
+    let config = CodeGraphConfig::default();
+    assert!(config.exclude_dirs.iter().any(|d| d == "node_modules"));
+    assert!(config.exclude_dirs.iter().any(|d| d == "target"));
+}
+
+#[test]
 fn test_full_build_cross_file_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
