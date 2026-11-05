@@ -1145,7 +1145,6 @@ mod tests {
         let h = style.total_height(cache.line_count);
         let messages = vec![msg];
         let caches = vec![cache];
-        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let start = style.top_margin + style.margin_vertical;
         // header 行（agent_name）与 prompt 第一行可点击
@@ -1196,7 +1195,6 @@ mod tests {
         let h = style.total_height(cache.line_count);
         let messages = vec![msg];
         let caches = vec![cache];
-        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let start = style.top_margin + style.margin_vertical;
         // 折叠态：仅 header 摘要行（tool_name + tool args）可点击
@@ -1291,7 +1289,6 @@ mod tests {
 
         // Click on header row of AgentCall (first content line = y + top_margin + margin_vertical)
         let header_row = user_h + agent_style.top_margin + agent_style.margin_vertical;
-        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
             tool_block_hit_test(&messages, &caches, header_row, 60).as_deref(),
             Some("call-1"),
