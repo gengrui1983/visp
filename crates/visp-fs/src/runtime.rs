@@ -126,7 +126,7 @@ impl PathAliases {
         }
         aliases
             .entries
-            .sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0.components().count()));
         aliases
     }
 
