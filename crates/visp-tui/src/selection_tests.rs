@@ -122,7 +122,13 @@ fn test_extract_selected_text_single_line() {
         start: Some((2, 2)),
         end: Some((6, 2)),
     };
-    let text = extract_selected_text(&buf, &sel, 0, &crate::app::BlockRows::default(), ratatui::layout::Rect::new(0, 0, 20, 5));
+    let text = extract_selected_text(
+        &buf,
+        &sel,
+        0,
+        &crate::app::BlockRows::default(),
+        ratatui::layout::Rect::new(0, 0, 20, 5),
+    );
     assert_eq!(text, "Hello");
 }
 
@@ -144,7 +150,13 @@ fn test_extract_selected_text_multi_line() {
         start: Some((2, 1)),
         end: Some((3, 2)),
     };
-    let text = extract_selected_text(&buf, &sel, 0, &crate::app::BlockRows::default(), ratatui::layout::Rect::new(0, 0, 20, 5));
+    let text = extract_selected_text(
+        &buf,
+        &sel,
+        0,
+        &crate::app::BlockRows::default(),
+        ratatui::layout::Rect::new(0, 0, 20, 5),
+    );
     assert_eq!(text, "ne1\nLine");
 }
 
@@ -162,7 +174,13 @@ fn test_extract_selected_text_chinese() {
         start: Some((0, 1)),
         end: Some((19, 2)),
     };
-    let text = extract_selected_text(&buf, &sel, 0, &crate::app::BlockRows::default(), ratatui::layout::Rect::new(0, 0, 20, 5));
+    let text = extract_selected_text(
+        &buf,
+        &sel,
+        0,
+        &crate::app::BlockRows::default(),
+        ratatui::layout::Rect::new(0, 0, 20, 5),
+    );
     // 不应有空格在中文之间
     assert_eq!(text, "你好世界\nHello 你好");
 }

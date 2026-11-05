@@ -229,12 +229,7 @@ pub fn extract_selected_text(
         let is_first = row == min_r_screen;
         let is_last = row == max_r_screen;
         let col_start = (if is_first { min_c } else { 0 }).max(col_lo);
-        let col_end = (if is_last {
-            max_c
-        } else {
-            scroll_col_hi
-        })
-        .min(col_hi);
+        let col_end = (if is_last { max_c } else { scroll_col_hi }).min(col_hi);
 
         if col_start > col_end {
             continue;

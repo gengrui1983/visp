@@ -1217,8 +1217,16 @@ mod tests {
         // 区域留给文本选择，点击不再触发折叠
         let mut expanded_set = std::collections::HashSet::new();
         expanded_set.insert("call-1".to_string());
-        let header_rows =
-            crate::app::wrap_text(&format!("{} {} {}", tool_icon("bash"), "bash", "command: cargo build"), 60).len() as u16;
+        let header_rows = crate::app::wrap_text(
+            &format!(
+                "{} {} {}",
+                tool_icon("bash"),
+                "bash",
+                "command: cargo build"
+            ),
+            60,
+        )
+        .len() as u16;
         let clickable_rows = header_rows.min(2);
         for row in start..(start + clickable_rows) {
             let result = tool_block_hit_test(&messages, &caches, row, 60);

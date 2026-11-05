@@ -921,7 +921,15 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
                         text_style,
                     ));
                 }
-                render_block(f, area, bs, &text_lines, visible_lines, area.y + rel_y, &mut app.block_rows);
+                render_block(
+                    f,
+                    area,
+                    bs,
+                    &text_lines,
+                    visible_lines,
+                    area.y + rel_y,
+                    &mut app.block_rows,
+                );
             }
         }
     }

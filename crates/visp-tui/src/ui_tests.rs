@@ -781,7 +781,9 @@ fn test_reload_listed_in_hint_and_help_with_daemon_note() {
 fn test_selection_highlight_only_block_content() {
     let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
     app.add_message(
-        LineType::ToolCall { name: "bash".into() },
+        LineType::ToolCall {
+            name: "bash".into(),
+        },
         r#"{"command":"ls"}"#.into(),
     );
 
@@ -842,7 +844,9 @@ fn test_block_rows_rebuilt_each_render() {
     // 每次渲染前必须清空行归属表，避免残留上一帧的行号
     let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
     app.add_message(
-        LineType::ToolCall { name: "bash".into() },
+        LineType::ToolCall {
+            name: "bash".into(),
+        },
         r#"{"command":"ls"}"#.into(),
     );
 
@@ -865,7 +869,9 @@ fn test_tool_call_clickable_only_first_two_rows() {
     // 可点击区域仅限 block 内容区前两行（ui.md）。
     let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
     app.add_message(
-        LineType::ToolCall { name: "bash".into() },
+        LineType::ToolCall {
+            name: "bash".into(),
+        },
         r#"{"command":"echo hello"}"#.into(),
     );
     app.tab_bar.tabs[0].messages[0].call_id = Some("call-1".into());
@@ -878,12 +884,7 @@ fn test_tool_call_clickable_only_first_two_rows() {
 
     let content_w = app.cache_width;
     let hit = |row: u16| {
-        crate::tool_ui::tool_block_hit_test(
-            app.messages(),
-            &app.message_caches,
-            row,
-            content_w,
-        )
+        crate::tool_ui::tool_block_hit_test(app.messages(), &app.message_caches, row, content_w)
     };
 
     // header 行（top_margin=1 + margin_vertical=1 → virtual_row=2）可点击
@@ -903,7 +904,9 @@ fn test_extract_selected_text_skips_scrollbar_and_blank_rows() {
     let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
     for i in 0..20 {
         app.add_message(
-            LineType::ToolCall { name: "bash".into() },
+            LineType::ToolCall {
+                name: "bash".into(),
+            },
             format!(r#"{{"command":"echo cmd{i}"}}"#),
         );
     }
@@ -936,10 +939,16 @@ fn test_extract_selected_text_skips_scrollbar_and_blank_rows() {
     );
 
     assert!(!text.contains('│'), "复制文本不应包含滚动条轨道: {text:?}");
-    assert!(text.contains("echo cmd"), "复制文本应包含 block 内容: {text:?}");
+    assert!(
+        text.contains("echo cmd"),
+        "复制文本应包含 block 内容: {text:?}"
+    );
     // block 留白行被跳过；block 之间的空气行产出空行（保留，与旧行为一致）
     for (i, line) in text.split('\n').enumerate() {
-        assert!(!line.ends_with('│'), "第 {i} 行不应以滚动条轨道结尾: {line:?}");
+        assert!(
+            !line.ends_with('│'),
+            "第 {i} 行不应以滚动条轨道结尾: {line:?}"
+        );
         assert_eq!(line.trim_end(), line, "第 {i} 行不应有行尾空白: {line:?}");
     }
 }
