@@ -1126,11 +1126,13 @@ fn handle_key_event(event: Event, app: &mut AppState, chat_handle: &mut ChatHand
                     return false;
                 }
 
-                // 检查是否点击在工具调用块头部（切换展开/折叠）
+                // 检查是否点击在工具调用块 header（tool_name/args、agent_name/prompt 第一行，
+                // 切换展开/折叠）
                 if let Some(call_id) = crate::tool_ui::tool_block_hit_test(
                     app.messages(),
                     &app.message_caches,
                     virtual_row,
+                    content_w,
                 ) {
                     app.toggle_tool_call_expansion(&call_id);
                     app.scroll_following = false;
@@ -1171,6 +1173,22 @@ fn handle_key_event(event: Event, app: &mut AppState, chat_handle: &mut ChatHand
 
             // 不在 chat area 内：清除选择，走原有逻辑
             app.text_selection.clear();
+
+            // 点击状态栏第 1 行的 session_id：复制完整会话 ID 到系统剪贴板。
+            // 复制提示（toast）显示期间第 1 行左侧不是 session_id，不响应。
+            if app.last_copy_msg.is_none()
+                && let Some((sx, sy)) = app.status_bar_first_row
+                && m.row == sy
+                && m.column >= sx
+                && m.column < sx + app.session_id.chars().take(8).count() as u16
+            {
+                crate::selection::osc52_copy(&app.session_id);
+                let now = std::time::Instant::now();
+                app.last_copy_msg = Some(format!("已复制: {}", app.session_id));
+                app.last_copy_time = Some(now);
+                app.needs_render = true;
+                return false;
+            }
 
             // 优先：点击子 tab 的 ✕ 关闭按钮
             if let Some(idx) = crate::ui::tab_close_at_screen(&app.tab_bar, m.column, m.row) {

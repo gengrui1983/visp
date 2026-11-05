@@ -309,6 +309,17 @@ pub enum LineType {
     },
 }
 
+/// 拖拽选择高亮用的屏幕行归属表（每次渲染重建）：
+/// - `content`：行 → block 内容列范围 `(x_start, x_end)`（高亮只涂内容列）
+/// - `blank`：block 内的留白行（边距 / 内边距 / 阴影行），高亮时整行跳过
+///
+/// 不在表中的行（block 之间的空气行、输入区等）保持全宽高亮。
+#[derive(Debug, Default, Clone)]
+pub struct BlockRows {
+    pub content: std::collections::HashMap<u16, (u16, u16)>,
+    pub blank: std::collections::HashSet<u16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatLine {
     pub id: u64,
@@ -1499,6 +1510,11 @@ pub struct AppState {
     pub last_mouse_click: Option<std::time::Instant>,
     /// 上一次渲染的 chat area 矩形（屏幕坐标，用于鼠标命中测试）
     pub chat_area_rect: (u16, u16, u16, u16),
+    /// 状态栏第 1 行的屏幕起点 (x, y)，用于 session_id 单击复制命中判定
+    pub status_bar_first_row: Option<(u16, u16)>,
+    /// 拖拽选择高亮用：渲染后每个屏幕行的 block 归属。
+    /// 每次渲染前清空，由 render_block / render_image_block 填充。
+    pub block_rows: BlockRows,
     /// 用户输入了 /new 命令，主循环需要创建新 session
     pub pending_new_session: bool,
     /// 用户输入了 /list 命令，主循环需要列出 session
@@ -1587,6 +1603,8 @@ impl AppState {
             last_copy_time: None,
             last_mouse_click: None,
             chat_area_rect: (0, 0, 0, 0),
+            status_bar_first_row: None,
+            block_rows: BlockRows::default(),
             pending_new_session: false,
             pending_list_sessions: false,
             pending_switch_session: None,

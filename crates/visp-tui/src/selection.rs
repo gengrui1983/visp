@@ -180,7 +180,20 @@ fn base64_encode(data: &[u8]) -> String {
 ///
 /// 逐行读取，跳过每行末尾的 padding 空格，多行之间用 \n 连接。
 /// `scroll_y` 用于将内容坐标转回屏幕坐标。
-pub fn extract_selected_text(buf: &Buffer, selection: &TextSelection, scroll_y: u16) -> String {
+///
+/// `block_rows`（渲染时重建的屏幕行归属表）用于跳过 block 留白行，
+/// 并把 block 内容行的提取范围裁剪到内容列内——否则 block 右侧的
+/// 边线字符（如 '▕'）会被一并复制出来。
+///
+/// `chat_area` 为聊天区矩形：最右 1 列是滚动条轨道，任何行都不应
+/// 复制到该列；行/列也统一裁剪到聊天区内。
+pub fn extract_selected_text(
+    buf: &Buffer,
+    selection: &TextSelection,
+    scroll_y: u16,
+    block_rows: &crate::app::BlockRows,
+    chat_area: ratatui::layout::Rect,
+) -> String {
     if !selection.is_active() {
         return String::new();
     }
@@ -193,19 +206,39 @@ pub fn extract_selected_text(buf: &Buffer, selection: &TextSelection, scroll_y: 
     let min_r_screen = min_r.saturating_sub(scroll_y);
     let max_r_screen = max_r.saturating_sub(scroll_y);
 
+    // 统一裁剪到聊天区：最右 1 列是滚动条轨道，永不复制
+    let min_r_screen = min_r_screen.max(chat_area.y);
+    let max_r_screen = max_r_screen.min(chat_area.bottom().saturating_sub(1));
+    let scroll_col_hi = chat_area.right().saturating_sub(2);
+
     let area = buf.area();
     let mut lines: Vec<String> = Vec::new();
 
     for row in min_r_screen..=max_r_screen {
+        // block 留白行（边距 / 内边距 / 阴影行）：跳过，不产出文本
+        if block_rows.blank.contains(&row) {
+            continue;
+        }
+        // block 内容行：裁剪到内容列范围 (x_start, x_end)（x_end 为排他上界，
+        // 与 apply_selection_highlight 的涂色语义一致）
+        let (col_lo, col_hi) = match block_rows.content.get(&row).copied() {
+            Some((xs, xe)) => (xs, xe.saturating_sub(1)),
+            None => (chat_area.x, scroll_col_hi),
+        };
         let mut line = String::new();
         let is_first = row == min_r_screen;
         let is_last = row == max_r_screen;
-        let col_start = if is_first { min_c } else { 0 };
-        let col_end = if is_last {
+        let col_start = (if is_first { min_c } else { 0 }).max(col_lo);
+        let col_end = (if is_last {
             max_c
         } else {
-            area.right().saturating_sub(1)
-        };
+            scroll_col_hi
+        })
+        .min(col_hi);
+
+        if col_start > col_end {
+            continue;
+        }
 
         let mut col = col_start;
         while col <= col_end {

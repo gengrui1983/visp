@@ -577,12 +577,19 @@ pub(crate) fn render_tool_error(msg: &ChatLine, width: u16) -> Vec<Line<'static>
 // Click hit-test (extracted from event.rs)
 // ════════════════════════════════════════════════════════════════
 
-/// Check if a mouse click at the given virtual_row hits a tool call block header.
-/// If so, returns the call_id to toggle. Returns None if no tool block was hit.
+/// Check if a mouse click at the given virtual_row hits the clickable header region of a
+/// tool/agent call block. If so, returns the call_id to toggle. Returns None otherwise.
+///
+/// 可点击区域（仅 block 内容区的前两行，见 ui.md 设计）：
+/// - ToolCall：header 摘要行（过长换行时最多前两行）
+/// - AgentCall：agent_name 行 + agent prompt 第一行
+///
+/// 其余区域（args、tool results 等）不触发折叠切换，放行给文本选择。
 pub(crate) fn tool_block_hit_test(
     messages: &[ChatLine],
     caches: &[crate::app::MessageCache],
     virtual_row: u16,
+    width: u16,
 ) -> Option<String> {
     let mut y: u16 = 0;
     for msg in messages {
@@ -591,13 +598,18 @@ pub(crate) fn tool_block_hit_test(
             let h = style.total_height(cache.line_count);
             if virtual_row >= y && virtual_row < y + h {
                 // Clicked on this message
-                if matches!(
-                    msg.line_type,
-                    LineType::ToolCall { .. } | LineType::AgentCall { .. }
-                ) && let Some(ref call_id) = msg.call_id
+                if let Some(ref call_id) = msg.call_id
+                    && matches!(
+                        msg.line_type,
+                        LineType::ToolCall { .. } | LineType::AgentCall { .. }
+                    )
                 {
-                    // 整个 tool/agent block（含展开的结果内容）均可点击切换展开/折叠
-                    return Some(call_id.clone());
+                    // 仅 header 区域可点击切换展开/折叠
+                    let start = y + style.top_margin + style.margin_vertical;
+                    let rows = clickable_header_rows(msg, width, h);
+                    if virtual_row >= start && virtual_row < start.saturating_add(rows) {
+                        return Some(call_id.clone());
+                    }
                 }
                 break;
             }
@@ -605,6 +617,29 @@ pub(crate) fn tool_block_hit_test(
         }
     }
     None
+}
+
+/// 计算 tool/agent block 中可触发折叠切换的 header 行数。
+///
+/// - ToolCall：header 摘要行（icon + name + args summary）
+/// - AgentCall：header 行（agent_name: sid [button]）+ agent prompt 第一行
+///
+/// 无论折叠/展开，可点击行数一律封顶为 2（"前两行"）：展开态下的
+/// 完整 args、tool results 等区域留给文本选择，点击不再触发折叠。
+///
+/// `block_h` 为整个 block 的渲染高度，用于兜底防止越界。
+fn clickable_header_rows(msg: &ChatLine, width: u16, block_h: u16) -> u16 {
+    let rows = match &msg.line_type {
+        LineType::ToolCall { name } => {
+            let icon = tool_icon(name);
+            let args_summary = format_tool_args_summary(name, &msg.content);
+            let header = format!("{} {} {}", icon, name, args_summary);
+            wrap_text(&header, width).len() as u16
+        }
+        LineType::AgentCall { .. } => 2, // header 行 + prompt 第一行
+        _ => return 0,
+    };
+    rows.min(2).min(block_h)
 }
 
 /// "[show in new tab]" 按钮文字长度
@@ -1086,10 +1121,10 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ── tool_block_hit_test: 整个 block 可点击 ──────────────
+    // ── tool_block_hit_test: 仅 header 区域可点击 ──────────────
 
     #[test]
-    fn test_tool_block_hit_test_agent_call_all_rows() {
+    fn test_tool_block_hit_test_agent_call_header_rows_only() {
         use crate::app::MessageCache;
         let msg = ChatLine {
             id: 1,
@@ -1110,20 +1145,100 @@ mod tests {
         let h = style.total_height(cache.line_count);
         let messages = vec![msg];
         let caches = vec![cache];
+        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Every row from 0 to h-1 should hit the block
-        for row in 0..h {
-            let result = tool_block_hit_test(&messages, &caches, row);
+        let start = style.top_margin + style.margin_vertical;
+        // header 行（agent_name）与 prompt 第一行可点击
+        for row in [start, start + 1] {
+            assert!(row < h, "row {} should be inside block (h={})", row, h);
+            let result = tool_block_hit_test(&messages, &caches, row, 60);
             assert_eq!(
                 result.as_deref(),
                 Some("call-1"),
-                "row {} should hit the block (h={})",
+                "row {} should hit the header region (h={})",
+                row,
+                h
+            );
+        }
+        // prompt 第二行及之后（result 行、留白）不可点击
+        for row in (start + 2)..h {
+            let result = tool_block_hit_test(&messages, &caches, row, 60);
+            assert!(
+                result.is_none(),
+                "row {} should NOT hit the header region (h={})",
                 row,
                 h
             );
         }
         // Row h should NOT hit
-        assert!(tool_block_hit_test(&messages, &caches, h).is_none());
+        assert!(tool_block_hit_test(&messages, &caches, h, 60).is_none());
+    }
+
+    #[test]
+    fn test_tool_block_hit_test_tool_call_header_rows_only() {
+        use crate::app::MessageCache;
+        let msg = ChatLine {
+            id: 1,
+            version: 0,
+            line_type: LineType::ToolCall {
+                name: "bash".into(),
+            },
+            content: r#"{"command":"cargo build"}"#.into(),
+            call_id: Some("call-1".into()),
+            tool_result: Some("ok".into()),
+            tool_error: false,
+            sub_session_id: None,
+        };
+        let cache = MessageCache::from_message(&msg, 60, false, None);
+        let style = crate::theme::style_for(LineType::ToolCall {
+            name: "bash".into(),
+        });
+        let h = style.total_height(cache.line_count);
+        let messages = vec![msg];
+        let caches = vec![cache];
+        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let start = style.top_margin + style.margin_vertical;
+        // 折叠态：仅 header 摘要行（tool_name + tool args）可点击
+        let result = tool_block_hit_test(&messages, &caches, start, 60);
+        assert_eq!(result.as_deref(), Some("call-1"), "header row should hit");
+        // result summary 行不可点击
+        for row in (start + 1)..h {
+            let result = tool_block_hit_test(&messages, &caches, row, 60);
+            assert!(
+                result.is_none(),
+                "row {} should NOT hit when collapsed (h={})",
+                row,
+                h
+            );
+        }
+
+        // 展开态：可点击区域仍为前两行（header 摘要行）；args / results
+        // 区域留给文本选择，点击不再触发折叠
+        let mut expanded_set = std::collections::HashSet::new();
+        expanded_set.insert("call-1".to_string());
+        let header_rows =
+            crate::app::wrap_text(&format!("{} {} {}", tool_icon("bash"), "bash", "command: cargo build"), 60).len() as u16;
+        let clickable_rows = header_rows.min(2);
+        for row in start..(start + clickable_rows) {
+            let result = tool_block_hit_test(&messages, &caches, row, 60);
+            assert_eq!(
+                result.as_deref(),
+                Some("call-1"),
+                "row {} should hit when expanded (h={})",
+                row,
+                h
+            );
+        }
+        for row in (start + clickable_rows)..h {
+            let result = tool_block_hit_test(&messages, &caches, row, 60);
+            assert!(
+                result.is_none(),
+                "row {} should NOT hit when expanded (h={})",
+                row,
+                h
+            );
+        }
     }
 
     #[test]
@@ -1168,8 +1283,9 @@ mod tests {
 
         // Click on header row of AgentCall (first content line = y + top_margin + margin_vertical)
         let header_row = user_h + agent_style.top_margin + agent_style.margin_vertical;
+        let expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
-            tool_block_hit_test(&messages, &caches, header_row).as_deref(),
+            tool_block_hit_test(&messages, &caches, header_row, 60).as_deref(),
             Some("call-1"),
             "header row should hit"
         );
@@ -1177,9 +1293,15 @@ mod tests {
         // Click on prompt row of AgentCall (second content line)
         let prompt_row = header_row + 1;
         assert_eq!(
-            tool_block_hit_test(&messages, &caches, prompt_row).as_deref(),
+            tool_block_hit_test(&messages, &caches, prompt_row, 60).as_deref(),
             Some("call-1"),
             "prompt row should hit"
+        );
+
+        // Click on result row (third content line) should NOT toggle
+        assert!(
+            tool_block_hit_test(&messages, &caches, prompt_row + 1, 60).is_none(),
+            "result row should not hit"
         );
 
         // agent_open_tab_hit_test should return None for prompt row (not a button click)

@@ -437,6 +437,13 @@ pub fn render(app: &mut AppState, f: &mut Frame) {
             f.buffer_mut(),
             &app.text_selection,
             app.scroll_state.y,
+            &app.block_rows,
+            ratatui::layout::Rect::new(
+                app.chat_area_rect.0,
+                app.chat_area_rect.1,
+                app.chat_area_rect.2,
+                app.chat_area_rect.3,
+            ),
         );
         if !text.is_empty() {
             app.pending_copy_text = Some(text);
@@ -454,7 +461,7 @@ pub fn render(app: &mut AppState, f: &mut Frame) {
 
     // 文本选择高亮：对选中区域应用浅蓝色背景
     if app.text_selection.is_highlighting() {
-        apply_selection_highlight(f, &app.text_selection, app.scroll_state.y);
+        apply_selection_highlight(f, &app.text_selection, app.scroll_state.y, &app.block_rows);
     }
 }
 
@@ -467,10 +474,16 @@ pub fn render(app: &mut AppState, f: &mut Frame) {
 // ════════════════════════════════════════════════════════════════
 
 /// 对选中区域的 buffer cells 应用浅蓝色背景
+///
+/// block 行为约束（ui.md）：拖拽选择时只涂蓝 block 内的内容 ——
+/// - 内容行：只涂内容列范围（跳过左右边距列与右侧阴影列）
+/// - 留白行（边距/内边距/阴影）：整行跳过
+/// - 其余行（block 间空气、输入区等）：保持全宽高亮
 fn apply_selection_highlight(
     f: &mut Frame,
     selection: &crate::selection::TextSelection,
     scroll_y: u16,
+    block_rows: &crate::app::BlockRows,
 ) {
     if !selection.is_active() {
         return;
@@ -479,11 +492,23 @@ fn apply_selection_highlight(
     let area = buf.area();
     let (x, right, y, bottom) = (area.x, area.right(), area.y, area.bottom());
     for row in y..bottom {
+        // block 留白行：不涂蓝
+        if block_rows.blank.contains(&row) {
+            continue;
+        }
+        // block 内容行：只涂内容列范围
+        let span = block_rows.content.get(&row).copied();
         for col in x..right {
-            if selection.contains(col, row, scroll_y) {
-                let cell = &mut buf[(col, row)];
-                cell.set_bg(theme::SELECTION_BG);
+            if !selection.contains(col, row, scroll_y) {
+                continue;
             }
+            if let Some((xs, xe)) = span
+                && (col < xs || col >= xe)
+            {
+                continue;
+            }
+            let cell = &mut buf[(col, row)];
+            cell.set_bg(theme::SELECTION_BG);
         }
     }
 }
@@ -526,6 +551,7 @@ fn render_block(
     lines: &[Line<'static>],
     line_count: u16,
     rel_y: u16,
+    rows: &mut crate::app::BlockRows,
 ) {
     let content_w = area.width.saturating_sub(1);
 
@@ -581,6 +607,31 @@ fn render_block(
                     buf[(x, row)].set_bg(theme::SHADOW);
                 }
             }
+        }
+    }
+
+    // 5) 记录本 block 的屏幕行归属（拖拽选择高亮用）：
+    //    内容行 → 内容列范围；留白行（边距/内边距/阴影行）→ 整行跳过高亮。
+    //    列范围与第 3 步 Paragraph 的实际渲染区域一致。
+    let content_x = area.x + style.margin_horizontal;
+    let content_w_adj = content_w.saturating_sub(style.margin_horizontal * 2);
+    let content_y = block_y + style.margin_vertical;
+    for row in block_y..content_y {
+        rows.blank.insert(row);
+    }
+    for row in content_y..content_y.saturating_add(actual_lines) {
+        rows.content
+            .insert(row, (content_x, content_x + content_w_adj));
+    }
+    if style.bg_fill.is_some() {
+        let fill_end = (block_y + style.margin_vertical + line_count + style.margin_vertical)
+            .min(f.area().bottom());
+        for row in content_y.saturating_add(actual_lines)..fill_end {
+            rows.blank.insert(row);
+        }
+        // 底部阴影行（第 4 步实际画出的那一行）
+        if style.shadow && actual_lines > 0 && fill_end < f.area().bottom() {
+            rows.blank.insert(fill_end);
         }
     }
 }
@@ -645,6 +696,10 @@ pub(crate) fn ensure_all_caches(app: &mut AppState, width: u16) -> bool {
 fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
     // 保存 chat area 矩形供鼠标命中测试使用
     app.chat_area_rect = (area.x, area.y, area.width, area.height);
+
+    // 重建拖拽选择高亮用的屏幕行归属表（每次渲染全量重建）
+    app.block_rows.content.clear();
+    app.block_rows.blank.clear();
 
     let content_w = area.width.saturating_sub(1);
 
@@ -742,7 +797,9 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
     let mut y: u16 = CHAT_PAD;
 
     // 子 tab 的 task prompt（渲染为第一条，不依赖 message_caches）
-    if let Some(ref prompt) = app.active_tab().task_prompt {
+    // clone 出来避免与 &mut app.block_rows 的借用冲突
+    let task_prompt = app.active_tab().task_prompt.clone();
+    if let Some(ref prompt) = task_prompt {
         let prompt_text = format!("📋 {}", prompt);
         let style = theme::USER_STYLE;
         let wrapped = crate::app::wrap_text(&prompt_text, render_w);
@@ -772,13 +829,14 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
                     &lines[start..end],
                     visible_lines,
                     area.y + rel_y,
+                    &mut app.block_rows,
                 );
             }
         }
         y += h;
     }
 
-    for msg in app.messages() {
+    for msg in app.messages().to_vec() {
         let style = theme::style_for(msg.line_type.clone());
         if let Some(cache) = app.message_caches.iter().find(|c| c.msg_id == msg.id) {
             let h = style.total_height(cache.line_count);
@@ -818,6 +876,7 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
                             visible_lines,
                             area.y + rel_y,
                             render_w,
+                            &mut app.block_rows,
                         );
                     } else {
                         let start = hidden_top as usize;
@@ -829,6 +888,7 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
                             &cache.lines[start..end],
                             visible_lines,
                             area.y + rel_y,
+                            &mut app.block_rows,
                         );
                     }
                 }
@@ -861,7 +921,7 @@ fn render_chat_area(app: &mut AppState, f: &mut Frame, area: Rect) {
                         text_style,
                     ));
                 }
-                render_block(f, area, bs, &text_lines, visible_lines, area.y + rel_y);
+                render_block(f, area, bs, &text_lines, visible_lines, area.y + rel_y, &mut app.block_rows);
             }
         }
     }
@@ -926,6 +986,7 @@ fn render_image_block(
     visible_lines: u16,
     y: u16,
     render_w: u16,
+    rows: &mut crate::app::BlockRows,
 ) {
     let img_h = visible_lines.min(line_count);
 
@@ -968,14 +1029,14 @@ fn render_image_block(
             let msg = format!("[加载中: {}]", alt_text);
             let line = Line::styled(msg, Style::default().fg(Color::DarkGray));
             let bs = theme::ASSISTANT_STYLE;
-            render_block(f, area, bs, &[line], image_h, y);
+            render_block(f, area, bs, &[line], image_h, y, rows);
         } else {
             // Error: show error message
             let reason = image_cache.error_message(path).unwrap_or_default();
             let msg = format!("[图片加载失败: {} ({})]", alt_text, reason);
             let line = Line::styled(msg, Style::default().fg(Color::Red));
             let bs = theme::ASSISTANT_STYLE;
-            render_block(f, area, bs, &[line], image_h, y);
+            render_block(f, area, bs, &[line], image_h, y, rows);
         }
     }
 
@@ -986,6 +1047,20 @@ fn render_image_block(
             if addr_y < area.bottom() {
                 f.render_widget(line.clone(), Rect::new(area.x + 1, addr_y, render_w, 1));
             }
+        }
+    }
+
+    // 记录图片 block 的内容行（拖拽选择高亮用）：图片 + 地址行均为内容，
+    // 列范围与实际渲染区域一致（margin_horizontal = 1）
+    let content_x = area.x + 1;
+    let content_end = (content_x + render_w).min(f.area().right());
+    for row in y..y.saturating_add(image_h).min(area.bottom()) {
+        rows.content.insert(row, (content_x, content_end));
+    }
+    for i in 0..addr_count {
+        let addr_y = y + image_h + i;
+        if addr_y < area.bottom() {
+            rows.content.insert(addr_y, (content_x, content_end));
         }
     }
 }
@@ -1304,7 +1379,9 @@ fn render_status_row(f: &mut Frame, area: Rect, left_text: &str, right_text: &st
 }
 
 /// 底部状态栏（2 行）：第 1 行会话/模型/状态 + 快捷键，第 2 行工作目录 + token 统计
-fn render_status_bar(app: &AppState, f: &mut Frame, area: Rect) {
+fn render_status_bar(app: &mut AppState, f: &mut Frame, area: Rect) {
+    // 记录第 1 行屏幕起点，供鼠标点击复制 session_id 命中判定使用
+    app.status_bar_first_row = Some((area.x, area.y));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])

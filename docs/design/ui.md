@@ -45,6 +45,8 @@
 
    Tokens和Cache的内容也可以压缩，比如input超过100，就可以用0.xk来表示，x表示一位小数，同理，超过十万就是0.xm，超过亿就是0.xb
 
+   单击session_id可以将其复制到系统粘贴板，我们有粘贴板功能，请直接复用
+
 
 ```
 
@@ -116,6 +118,8 @@ token_speed 是最终统计速度：结算输出 tokens（即 token_output）/ �
  └───────────────────────────────────────┘
 
 ```
+
+注意，只有点击 tool_name和 tool args部分才会触发闭合
 
 
 ### ReadFile
@@ -263,7 +267,23 @@ token_speed 是最终统计速度：结算输出 tokens（即 token_output）/ �
  └─────────────────────────────────────────────────────┘
 
 ```
+注意，只有点击 agent_name和agent prompt第一行部分才会触发闭合
 
 
 ---
 
+
+------------
+
+
+## 鼠标拖拽选择高亮
+
+对话区支持鼠标拖拽选择文本：选中区域涂浅蓝色（`theme::SELECTION_BG`），松开左键自动复制（OSC 52 / 系统剪贴板），Esc 清除选择。
+
+**block 行为约束：拖拽时只涂蓝 block 内的内容**（`ui.rs: apply_selection_highlight` + `app.rs: BlockRows`）：
+
+- 渲染时 `render_block` / `render_image_block` 记录每个屏幕行的归属（`AppState.block_rows`，每帧全量重建）：
+  - **内容行** → 内容列范围 `(x_start, x_end)`，高亮只涂内容列（跳过左右 `margin_horizontal` 边距列与右侧阴影列）
+  - **留白行**（`top_margin` 空气行 / `margin_vertical` 内边距行 / 底部阴影行）→ 整行跳过高亮
+- 不在表中的行（block 之间的空气行、输入区、状态栏等）保持原有的全宽高亮
+- 复制内容提取（`extract_selected_text` / 溯源层）不受影响，仍按选区矩形提取原文

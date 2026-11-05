@@ -774,3 +774,172 @@ fn test_reload_listed_in_hint_and_help_with_daemon_note() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── 拖拽选择高亮：只涂蓝 block 内的内容 ───────────────────────
+
+#[test]
+fn test_selection_highlight_only_block_content() {
+    let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
+    app.add_message(
+        LineType::ToolCall { name: "bash".into() },
+        r#"{"command":"ls"}"#.into(),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+
+    // 渲染后行归属表必须已填充
+    assert!(!app.block_rows.content.is_empty(), "content rows 未记录");
+    assert!(!app.block_rows.blank.is_empty(), "blank rows 未记录");
+
+    // TOOL_CALL_STYLE: top_margin=1, margin_vertical=1, margin_horizontal=1
+    // 内容列范围 = chat_area.x + 1 .. chat_area.x + content_w - 1
+    let (cx, cy, cw, _) = app.chat_area_rect;
+    let content_w = cw - 1;
+    let expected_span = (cx + 1, cx + content_w - 1);
+
+    // 取一个内容行验证 span 与渲染列一致
+    let (&crow, &span) = app
+        .block_rows
+        .content
+        .iter()
+        .find(|&(_, &s)| s == expected_span)
+        .expect("应存在与预期列范围一致的内容行");
+    assert!(crow >= cy, "内容行应位于 chat area 内");
+
+    // 全屏拖拽选择
+    let sel = crate::selection::TextSelection {
+        start: Some((0, 0)),
+        end: Some((79, 23)),
+    };
+    terminal
+        .draw(|f| super::apply_selection_highlight(f, &sel, 0, &app.block_rows))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    // 内容行：内容列范围内涂蓝，边距列（x=0）不涂
+    assert_eq!(buf[(span.0, crow)].bg, theme::SELECTION_BG);
+    assert_eq!(buf[(cx, crow)].bg, Color::Reset);
+    // 右侧阴影列（content_w）不涂
+    assert_eq!(buf[(cx + content_w, crow)].bg, Color::Reset);
+
+    // 留白行（top_margin 行 = 内容行上方 1 行）整行不涂
+    let blank_row = crow - 1;
+    assert!(app.block_rows.blank.contains(&blank_row));
+    assert_eq!(buf[(cx + 5, blank_row)].bg, Color::Reset);
+
+    // block 外的空气行（chat area 顶部第一行）保持全宽高亮
+    let air_row = cy;
+    assert!(!app.block_rows.content.contains_key(&air_row));
+    assert!(!app.block_rows.blank.contains(&air_row));
+    assert_eq!(buf[(cx, air_row)].bg, theme::SELECTION_BG);
+    assert_eq!(buf[(cx + content_w - 1, air_row)].bg, theme::SELECTION_BG);
+}
+
+#[test]
+fn test_block_rows_rebuilt_each_render() {
+    // 每次渲染前必须清空行归属表，避免残留上一帧的行号
+    let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
+    app.add_message(
+        LineType::ToolCall { name: "bash".into() },
+        r#"{"command":"ls"}"#.into(),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+    assert!(!app.block_rows.content.is_empty());
+    let first = app.block_rows.content.clone();
+
+    // 再次渲染（无状态变化）后表应被重建且内容一致
+    terminal.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+    assert_eq!(app.block_rows.content, first);
+}
+
+// ── 回归：tool block 可点击区域 / 拖拽复制裁剪 ─────────────────
+
+#[test]
+fn test_tool_call_clickable_only_first_two_rows() {
+    // 回归：展开态下点击完整 args / results 区域不应触发折叠，
+    // 可点击区域仅限 block 内容区前两行（ui.md）。
+    let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
+    app.add_message(
+        LineType::ToolCall { name: "bash".into() },
+        r#"{"command":"echo hello"}"#.into(),
+    );
+    app.tab_bar.tabs[0].messages[0].call_id = Some("call-1".into());
+    app.insert_tool_result("call-1", "out\nline2\nline3".to_string());
+    app.expanded_tool_calls.insert("call-1".into());
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+
+    let content_w = app.cache_width;
+    let hit = |row: u16| {
+        crate::tool_ui::tool_block_hit_test(
+            app.messages(),
+            &app.message_caches,
+            row,
+            content_w,
+        )
+    };
+
+    // header 行（top_margin=1 + margin_vertical=1 → virtual_row=2）可点击
+    assert_eq!(hit(2).as_deref(), Some("call-1"));
+    // header 之后的所有内容行（args / results）均不可点击
+    let block_h = crate::theme::style_for(app.messages()[0].line_type.clone())
+        .total_height(app.message_caches[0].line_count);
+    for row in 3..(2 + block_h) {
+        assert_eq!(hit(row), None, "row {row} 不应触发折叠");
+    }
+}
+
+#[test]
+fn test_extract_selected_text_skips_scrollbar_and_blank_rows() {
+    // 回归：拖拽复制会带上滚动条轨道字符 '│'（chat area 最右列）和
+    // block 留白行的 padding。提取时按 block_rows 裁剪到内容列。
+    let mut app = AppState::new("main".into(), "m".into(), "".into(), String::new());
+    for i in 0..20 {
+        app.add_message(
+            LineType::ToolCall { name: "bash".into() },
+            format!(r#"{{"command":"echo cmd{i}"}}"#),
+        );
+    }
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+
+    // 20 条消息超出 24 行视窗 → 滚动条必须已渲染
+    assert!(app.scrollbar_geo.is_some(), "滚动条未渲染");
+
+    let (cx, cy, cw, ch) = app.chat_area_rect;
+    // 选择坐标为内容坐标（屏幕行 + scroll_y）
+    let sy = app.scroll_state.y;
+    let sel = crate::selection::TextSelection {
+        start: Some((cx, cy + sy)),
+        end: Some((cx + cw - 1, cy + ch - 1 + sy)),
+    };
+    let text = crate::selection::extract_selected_text(
+        terminal.backend().buffer(),
+        &sel,
+        app.scroll_state.y,
+        &app.block_rows,
+        ratatui::layout::Rect::new(
+            app.chat_area_rect.0,
+            app.chat_area_rect.1,
+            app.chat_area_rect.2,
+            app.chat_area_rect.3,
+        ),
+    );
+
+    assert!(!text.contains('│'), "复制文本不应包含滚动条轨道: {text:?}");
+    assert!(text.contains("echo cmd"), "复制文本应包含 block 内容: {text:?}");
+    // block 留白行被跳过；block 之间的空气行产出空行（保留，与旧行为一致）
+    for (i, line) in text.split('\n').enumerate() {
+        assert!(!line.ends_with('│'), "第 {i} 行不应以滚动条轨道结尾: {line:?}");
+        assert_eq!(line.trim_end(), line, "第 {i} 行不应有行尾空白: {line:?}");
+    }
+}
