@@ -5491,11 +5491,9 @@ version = "0.5.4"
 dependencies = [
  "arc-swap",
  "async-trait",
- "dashmap",
  "futures",
  "libc",
  "opentelemetry",
- "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -5509,7 +5507,6 @@ dependencies = [
  "toml",
  "tonic 0.13.1",
  "tracing",
- "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
@@ -5524,7 +5521,7 @@ dependencies = [
  "visp-hooks",
  "visp-llm",
  "visp-mcp",
- "visp-metrics",
+ "visp-observability",
  "visp-proto",
  "visp-tools",
 ]
@@ -5605,13 +5602,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "visp-metrics"
+name = "visp-observability"
 version = "0.5.4"
 dependencies = [
+ "async-trait",
  "dashmap",
+ "futures",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "serde_json",
  "serial_test",
+ "tempfile",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
  "tracing-subscriber",
+ "visp-config",
+ "visp-core",
 ]
 
 [[package]]

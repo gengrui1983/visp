@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use serial_test::serial;
 
-use visp_daemon::config::{LangfuseConfig, ObservabilityConfig, OtlpConfig};
-use visp_daemon::observability::init::init_observability;
+use visp_config::{LangfuseConfig, ObservabilityConfig, OtlpConfig};
+use visp_observability::init::init_observability;
 
 // ---------------------------------------------------------------------------
 // D3: OTLP collector unreachable — graceful degradation

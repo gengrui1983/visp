@@ -18,7 +18,7 @@ visp-agent = { path = "../visp-agent" }
 visp-config = { path = "../visp-config" }
 visp-fs = { path = "../visp-fs" }
 visp-hooks = { path = "../visp-hooks" }
-visp-metrics = { path = "../visp-metrics" }
+visp-observability = { path = "../visp-observability" }
 serde.workspace = true
 serde_json.workspace = true
 arc-swap.workspace = true
@@ -32,13 +32,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 toml = "0.8"
 uuid.workspace = true
-dashmap = "5"
 futures.workspace = true
-tracing-appender = "0.2"
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry = { workspace = true }
-opentelemetry-otlp = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

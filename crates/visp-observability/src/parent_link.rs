@@ -394,8 +394,8 @@ mod tests {
     use tracing_subscriber::registry::LookupSpan;
 
     use super::*;
-    use crate::config::OtlpConfig;
-    use crate::observability::otlp;
+    use crate::otlp;
+    use visp_config::OtlpConfig;
 
     /// Injector layer that places a `SpanW3CId` into every new span's
     /// extension.

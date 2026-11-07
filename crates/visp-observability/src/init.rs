@@ -15,10 +15,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
-use crate::observability::otlp;
-use crate::observability::parent_link::ParentLinkLayer;
+use crate::metrics_layer::MetricsLayer;
+use crate::otlp;
+use crate::parent_link::ParentLinkLayer;
 use visp_config::ObservabilityConfig;
-use visp_metrics::MetricsLayer;
 
 /// Output of [`init_observability`]; held for the lifetime of the program.
 #[allow(dead_code)]
@@ -488,7 +488,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::config::{ObservabilityConfig, OtlpConfig};
+    use visp_config::{ObservabilityConfig, OtlpConfig};
 
     /// In-memory writer that captures bytes via `Arc<Mutex<Vec<u8>>>`.
     #[derive(Clone)]
@@ -590,7 +590,7 @@ mod tests {
     /// in `tests/observability_global_subscriber.rs`, which runs in its own
     /// process so `try_init()` succeeds uncontested.
     ///
-    /// Run in isolation:  `cargo test -p visp-daemon --test observability_global_subscriber`
+    /// Run in isolation:  `cargo test -p visp-observability --test observability_global_subscriber`
     #[test]
     #[serial]
     fn test_init_global_observability_with_writer_function_exists() {

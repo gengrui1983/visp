@@ -1,5 +1,4 @@
 mod config;
-mod observability;
 mod server;
 mod service;
 mod shutdown;
@@ -193,7 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Init observability (tracing subscriber stack)
     //    Guard lives for the lifetime of main; on drop it unwinds the subscriber.
-    let _observability_guard = crate::observability::init::init_observability(
+    let _observability_guard = visp_observability::init::init_observability(
         &config.observability,
         &config.daemon.log_level,
     );

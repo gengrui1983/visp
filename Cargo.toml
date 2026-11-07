@@ -15,7 +15,7 @@ members = [
     "crates/visp-hooks",
     "crates/visp-llm",
     "crates/visp-mcp",
-    "crates/visp-metrics",
+    "crates/visp-observability",
     "crates/visp-proto",
     "crates/visp-tools",
 ]

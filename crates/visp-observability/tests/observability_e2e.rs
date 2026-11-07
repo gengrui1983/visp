@@ -1,4 +1,4 @@
-//! End-to-end integration tests for visp-daemon observability.
+//! End-to-end integration tests for visp-observability.
 //!
 //! These tests exercise the full tracing subscriber stack
 //! (EnvFilter → ParentLinkLayer → MetricsLayer → fmt JSON) with real
@@ -52,8 +52,8 @@ use visp_core::session::{InMemorySessionStore, SessionManager};
 use visp_core::tool::{Tool, ToolContext, ToolResult};
 use visp_core::tool_registry::ToolRegistry;
 
-use visp_daemon::config::ObservabilityConfig;
-use visp_daemon::observability::init::init_observability_with_writer;
+use visp_config::ObservabilityConfig;
+use visp_observability::init::init_observability_with_writer;
 
 // ---------------------------------------------------------------------------
 // Shared global observability for tests in this binary
@@ -64,7 +64,7 @@ use visp_daemon::observability::init::init_observability_with_writer;
 /// once and re-use the same writer across all tests.
 static SHARED_OBSERVABILITY: std::sync::OnceLock<(
     TestVecWriter,
-    visp_daemon::observability::init::ObservabilityGuard,
+    visp_observability::init::ObservabilityGuard,
 )> = std::sync::OnceLock::new();
 
 /// Returns the shared writer used by the global subscriber.
@@ -89,7 +89,7 @@ fn shared_writer() -> &'static TestVecWriter {
 }
 
 /// Access the shared [`ObservabilityGuard`] (for parent_link / metrics handles).
-fn shared_guard() -> &'static visp_daemon::observability::init::ObservabilityGuard {
+fn shared_guard() -> &'static visp_observability::init::ObservabilityGuard {
     let (_, ref guard) = *SHARED_OBSERVABILITY.get_or_init(|| {
         let w = TestVecWriter::new();
         let cfg = ObservabilityConfig {

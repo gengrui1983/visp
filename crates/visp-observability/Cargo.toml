@@ -1,0 +1,26 @@
+[package]
+name = "visp-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+visp-config = { path = "../visp-config" }
+visp-core = { path = "../visp-core" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"
+dashmap = "5"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true

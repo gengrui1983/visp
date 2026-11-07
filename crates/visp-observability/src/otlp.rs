@@ -9,7 +9,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, SpanExporter};
 
-use crate::config::OtlpConfig;
+use visp_config::OtlpConfig;
 
 /// Build a production OTLP tracer provider via gRPC-tonic.
 ///
@@ -123,7 +123,6 @@ pub(crate) fn build_resource() -> Resource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OtlpConfig;
     use opentelemetry::trace::{Span, Tracer, TracerProvider};
     use opentelemetry_sdk::trace::InMemorySpanExporter;
 

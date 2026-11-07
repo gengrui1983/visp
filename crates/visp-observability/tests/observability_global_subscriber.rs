@@ -8,7 +8,7 @@
 //! - `init.rs` unit test `test_init_global_observability_with_writer_function_exists`
 //!   (compilation / smoke check).
 //!
-//! Run: `cargo test -p visp-daemon --test observability_global_subscriber`
+//! Run: `cargo test -p visp-observability --test observability_global_subscriber`
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use serial_test::serial;
 use tracing_subscriber::fmt::MakeWriter;
 
-use visp_daemon::config::ObservabilityConfig;
-use visp_daemon::observability::init::init_observability_with_writer;
+use visp_config::ObservabilityConfig;
+use visp_observability::init::init_observability_with_writer;
 
 // ---------------------------------------------------------------------------
 // In-memory writer
