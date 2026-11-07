@@ -11,6 +11,7 @@ visp-hooks = { path = "../visp-hooks" }
 visp-llm = { path = "../visp-llm" }
 visp-tools = { path = "../visp-tools" }
 visp-config = { path = "../visp-config" }
+visp-observability = { path = "../visp-observability" }
 tokio.workspace = true
 tokio-util = "0.7"
 arc-swap.workspace = true

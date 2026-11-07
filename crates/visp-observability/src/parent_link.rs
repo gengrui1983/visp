@@ -23,7 +23,14 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use visp_core::trace_context::SpanW3CId;
+/// Newtype wrapping a 16-hex W3C span ID, stored in span extensions for
+/// cross‑layer span identification.
+///
+/// Written to the extension of every `visp.agent.run`, `visp.agent.iteration`,
+/// and `visp.subagent.spawn` span so that [`ParentLinkLayer`] can register
+/// a bidirectional mapping between W3C span IDs and tracing span IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanW3CId(pub String);
 
 /// Custom fields inserted into the span extension when trace context fields
 /// are recorded via `span.record()`.
@@ -1245,5 +1252,15 @@ mod tests {
             "visp.span.w3c_id not found in any JSON line.\nOutput:\n{}",
             output
         );
+    }
+
+    // ── SpanW3CId newtype ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_span_w3c_id_newtype() {
+        let id = "b7ad6b7169203331".to_string();
+        let sw = SpanW3CId(id.clone());
+        assert_eq!(sw.0, id);
+        let _ = format!("{sw:?}"); // Debug
     }
 }

@@ -39,6 +39,8 @@ use visp_hooks::{
     StopFailurePayload, StopPayload, StopStatus, UserPromptSubmitPayload, VISP_HOOK_SCHEMA,
 };
 
+use visp_observability::LangfuseSpanConfig;
+
 use crate::active_agent::{ActiveAgent, ActiveAgentRegistry};
 
 /// 根据 allowed_sub_agents 筛选子 Agent 的工具列表
@@ -981,9 +983,9 @@ impl Orchestrator {
 
         // 记录 Langfuse trace 级字段（仅 enabled 时写入）
         // 使用 parent_session_id 确保同 trace 内的 session/name 一致
-        visp_core::agent_loop::record_langfuse_trace_fields(
+        visp_observability::record_langfuse_trace_fields(
             &spawn_span,
-            &self.agent_config,
+            &LangfuseSpanConfig::from(&self.agent_config),
             parent_session_id,
         );
 

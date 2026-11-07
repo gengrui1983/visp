@@ -259,11 +259,3 @@ fn test_generate_w3c_span_id_unique() {
     let id2 = generate_w3c_span_id();
     assert_ne!(id1, id2, "successive calls must produce different IDs");
 }
-
-#[test]
-fn test_span_w3c_id_newtype() {
-    let id = generate_w3c_span_id();
-    let sw = SpanW3CId(id.clone());
-    assert_eq!(sw.0, id);
-    let _ = format!("{sw:?}"); // Debug
-}

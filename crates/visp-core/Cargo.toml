@@ -17,6 +17,7 @@ tokio-util = "0.7"
 tracing.workspace = true
 visp-config = { path = "../visp-config" }
 visp-hooks = { path = "../visp-hooks" }
+visp-observability = { path = "../visp-observability" }
 
 [dev-dependencies]
 tempfile = "3"

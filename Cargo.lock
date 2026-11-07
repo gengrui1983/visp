@@ -5407,6 +5407,7 @@ dependencies = [
  "visp-core",
  "visp-hooks",
  "visp-llm",
+ "visp-observability",
  "visp-tools",
 ]
 
@@ -5483,6 +5484,7 @@ dependencies = [
  "visp-config",
  "visp-hooks",
  "visp-llm",
+ "visp-observability",
 ]
 
 [[package]]

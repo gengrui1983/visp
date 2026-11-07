@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use visp_observability::LangfuseSpanConfig;
 
 /// 用户查询结果
 #[derive(Debug, Clone, Default)]
@@ -479,6 +480,21 @@ impl Default for AgentConfig {
             langfuse_capture_output: false,
             langfuse_capture_max_chars: 20_000,
             langfuse_redact_secrets: true,
+        }
+    }
+}
+
+impl From<&AgentConfig> for LangfuseSpanConfig {
+    fn from(cfg: &AgentConfig) -> Self {
+        Self {
+            langfuse_enabled: cfg.langfuse_enabled,
+            langfuse_user_id: cfg.langfuse_user_id.clone(),
+            langfuse_tags: cfg.langfuse_tags.clone(),
+            langfuse_environment: cfg.langfuse_environment.clone(),
+            langfuse_release: cfg.langfuse_release.clone(),
+            langfuse_version: cfg.langfuse_version.clone(),
+            langfuse_public: cfg.langfuse_public,
+            langfuse_metadata: cfg.langfuse_metadata.clone(),
         }
     }
 }

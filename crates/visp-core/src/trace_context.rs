@@ -140,19 +140,6 @@ impl TraceContext {
 }
 
 // ---------------------------------------------------------------------------
-// SpanW3CId — newtype for W3C span ID stored in span extensions.
-// ---------------------------------------------------------------------------
-
-/// Newtype wrapping a 16-hex W3C span ID, stored in span extensions for
-/// cross‑layer span identification.
-///
-/// Written to the extension of every `visp.agent.run`, `visp.agent.iteration`,
-/// and `visp.subagent.spawn` span so that [`ParentLinkLayer`] can register
-/// a bidirectional mapping between W3C span IDs and tracing span IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpanW3CId(pub String);
-
-// ---------------------------------------------------------------------------
 // W3C ID generators
 // ---------------------------------------------------------------------------
 
