@@ -41,6 +41,7 @@ use crate::hook_map::{MapCtx, map_frame};
 /// 契约：`drain` 必须在 `budget` 内返回；真实执行器停止接收新 hook 工作、等待在飞
 /// 执行完成后返回。调用方另有同长硬超时兜底，宿主即使超时也不会拖住关停。
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait 展开的 Pin<Box<dyn Future>> 触发误报
 pub trait HookDrainHost: Send + Sync {
     /// 在 `budget` 内排空在飞的 hook 执行。
     async fn drain(&self, budget: Duration);

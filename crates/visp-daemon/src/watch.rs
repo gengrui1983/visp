@@ -298,6 +298,7 @@ fn child_rule(name: &str, domain: ReloadDomain) -> WatchRule {
 /// 真实实现 [`CoreReloadExecutor`] 委托 [`ReloadCore::reload_domains`]；
 /// 测试注入假体记录调用，避免依赖真实资产。
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)] // async_trait 展开的 Pin<Box<dyn Future>> 触发误报
 pub trait ReloadExecutor: Send + Sync + 'static {
     /// 重载给定领域子集，返回逐项结果。
     async fn reload_domains(&self, domains: &[ReloadDomain]) -> Vec<ReloadItem>;

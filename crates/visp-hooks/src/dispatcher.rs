@@ -193,6 +193,7 @@ pub fn select_matches<'a>(
 ///
 /// 本任务不提供进程 spawn 实现；测试用 [`RecordingHandler`] 记录调用。
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait 展开的 Pin<Box<dyn Future>> 触发误报
 pub trait Handler: Send + Sync {
     /// 执行一次规则；内核保证：同规则串行（除非 `parallel`），跨规则按 [`select_matches`] 顺序。
     async fn run(&self, rule: &DispatchRule, event: &DispatchInput);

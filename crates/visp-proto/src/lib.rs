@@ -12,7 +12,8 @@
 // 而 tonic::Status 体积较大（约 176 字节），会触发 clippy 的
 // result_large_err lint（CI 以 -D warnings 运行）。生成的代码
 // 无法修改，此处对该模块整体豁免该 lint。
-#[allow(clippy::result_large_err)]
+// clippy::double_must_use：新版 clippy 对 async_trait 展开的 Pin<Box<dyn Future>> 误报。
+#[allow(clippy::result_large_err, clippy::double_must_use)]
 pub mod visp {
     tonic::include_proto!("visp");
 }
