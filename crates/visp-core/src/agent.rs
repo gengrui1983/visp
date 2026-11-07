@@ -488,6 +488,8 @@ impl From<&AgentConfig> for LangfuseSpanConfig {
     fn from(cfg: &AgentConfig) -> Self {
         Self {
             langfuse_enabled: cfg.langfuse_enabled,
+            langfuse_session_id: None,
+            langfuse_trace_name: Some("visp.agent.run".to_string()),
             langfuse_user_id: cfg.langfuse_user_id.clone(),
             langfuse_tags: cfg.langfuse_tags.clone(),
             langfuse_environment: cfg.langfuse_environment.clone(),

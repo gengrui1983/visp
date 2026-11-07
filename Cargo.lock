@@ -5583,6 +5583,7 @@ dependencies = [
  "tracing-subscriber",
  "visp-config",
  "visp-core",
+ "visp-observability",
 ]
 
 [[package]]

@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use visp_config::LlmConfig;
+
 /// Langfuse-related configuration snapshot used by [`record_langfuse_trace_fields`].
 ///
 /// Mirrors the Langfuse subset of the agent configuration so that span
@@ -14,6 +16,10 @@ use std::collections::HashMap;
 pub struct LangfuseSpanConfig {
     /// Langfuse 总开关
     pub langfuse_enabled: bool,
+    /// Langfuse session.id 覆盖值（Some 时优先于调用方传入的 session_id）
+    pub langfuse_session_id: Option<String>,
+    /// Langfuse trace.name 字段值（None = 不设置）
+    pub langfuse_trace_name: Option<String>,
     /// Langfuse user.id 字段值（None = 不设置）
     pub langfuse_user_id: Option<String>,
     /// Langfuse tags 字段值（JSON 字符串，None = 不设置）
@@ -82,8 +88,14 @@ pub fn record_langfuse_trace_fields(
     if !cfg.langfuse_enabled {
         return;
     }
-    span.record("langfuse.session.id", session_id);
-    span.record("langfuse.trace.name", "visp.agent.run".to_string());
+    if let Some(sid) = cfg.langfuse_session_id.as_deref() {
+        span.record("langfuse.session.id", sid);
+    } else if !session_id.is_empty() {
+        span.record("langfuse.session.id", session_id);
+    }
+    if let Some(name) = cfg.langfuse_trace_name.as_deref() {
+        span.record("langfuse.trace.name", name);
+    }
 
     if let Some(ref user_id) = cfg.langfuse_user_id {
         span.record("langfuse.user.id", user_id.as_str());
@@ -110,6 +122,23 @@ pub fn record_langfuse_trace_fields(
     }
 }
 
+impl From<&LlmConfig> for LangfuseSpanConfig {
+    fn from(config: &LlmConfig) -> Self {
+        Self {
+            langfuse_enabled: config.langfuse_enabled,
+            langfuse_session_id: config.langfuse_session_id.clone(),
+            langfuse_trace_name: config.langfuse_trace_name.clone(),
+            langfuse_user_id: config.langfuse_user_id.clone(),
+            langfuse_tags: config.langfuse_tags.clone(),
+            langfuse_environment: config.langfuse_environment.clone(),
+            langfuse_release: config.langfuse_release.clone(),
+            langfuse_version: config.langfuse_version.clone(),
+            langfuse_public: config.langfuse_public,
+            langfuse_metadata: config.langfuse_metadata.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -123,6 +152,8 @@ mod tests {
         metadata.insert("k".to_string(), "v".to_string());
         LangfuseSpanConfig {
             langfuse_enabled: true,
+            langfuse_session_id: None,
+            langfuse_trace_name: Some("visp.agent.run".to_string()),
             langfuse_user_id: Some("user-1".to_string()),
             langfuse_tags: Some("[\"a\"]".to_string()),
             langfuse_environment: Some("prod".to_string()),
@@ -158,6 +189,32 @@ mod tests {
             langfuse.trace.metadata = tracing::field::Empty,
         );
         // Recording all declared fields must not panic.
+        record_langfuse_trace_fields(&span, &cfg, "session-1");
+    }
+
+    #[test]
+    fn test_record_langfuse_session_id_override() {
+        let mut cfg = full_cfg();
+        cfg.langfuse_session_id = Some("override-session".to_string());
+        let span = tracing::info_span!(
+            "session_override_test",
+            langfuse.session.id = tracing::field::Empty,
+            langfuse.trace.name = tracing::field::Empty,
+        );
+        // cfg.langfuse_session_id takes precedence over the session_id argument.
+        record_langfuse_trace_fields(&span, &cfg, "arg-session");
+    }
+
+    #[test]
+    fn test_record_langfuse_trace_name_none_skips() {
+        let mut cfg = full_cfg();
+        cfg.langfuse_trace_name = None;
+        let span = tracing::info_span!(
+            "trace_name_none_test",
+            langfuse.session.id = tracing::field::Empty,
+            langfuse.trace.name = tracing::field::Empty,
+        );
+        // Missing trace.name must be skipped without panicking.
         record_langfuse_trace_fields(&span, &cfg, "session-1");
     }
 
