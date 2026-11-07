@@ -1543,6 +1543,7 @@ impl LlmProvider for OpenAiProvider {
             build_openai_request_with_policy(messages, tools, config, self.reasoning_policy);
         let mut headers = build_openai_headers(&self.api_key);
         self.apply_extra_headers(&mut headers, config);
+
         let capture_enabled = config.langfuse_capture_input || config.langfuse_capture_output;
         if capture_enabled {
             span.record("langfuse.observation.type", "generation");

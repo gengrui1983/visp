@@ -7,6 +7,7 @@ use visp_config::LlmConfig;
 use visp_core::error::LlmError;
 use visp_core::message::{Message, Role, ToolDefinition};
 use visp_core::provider::{ChatEvent, LlmProvider};
+use visp_observability::{LangfuseSpanConfig, init_span};
 
 use crate::image_util;
 use crate::util::{build_client, parse_retry_after};
@@ -543,14 +544,17 @@ impl LlmProvider for AnthropicProvider {
         // Provider name from config (falls back to "anthropic" for backward compat)
         let provider_name = config.provider.as_deref().unwrap_or("anthropic");
         // 创建 gen_ai.client.operation span（OTel Semantic Conventions 标准命名）
-        let span = tracing::info_span!(
+        let lf_cfg = LangfuseSpanConfig::from(config);
+        let span = init_span!(
+            &lf_cfg,
+            config.langfuse_session_id.as_deref().unwrap_or(""),
             "gen_ai.client.operation",
-            gen_ai.system = field::Empty,
+            gen_ai.system = "anthropic",
             gen_ai.request.model = %config.model,
             gen_ai.operation.name = "chat",
             gen_ai.provider.name = %provider_name,
-            gen_ai.request.max_tokens = field::Empty,
-            gen_ai.request.temperature = field::Empty,
+            gen_ai.request.max_tokens = config.max_tokens as i64,
+            gen_ai.request.temperature = config.temperature,
             visp.llm.attempt = 0u64,
             gen_ai.usage.input_tokens = field::Empty,
             gen_ai.usage.output_tokens = field::Empty,
@@ -559,59 +563,9 @@ impl LlmProvider for AnthropicProvider {
             gen_ai.response.finish_reasons = field::Empty,
             gen_ai.response.model = field::Empty,
             visp.llm.token_limit_hit = field::Empty,
-            langfuse.observation.type = field::Empty,
-            langfuse.observation.input = field::Empty,
             visp.tools.definitions = field::Empty,
-            langfuse.observation.output = field::Empty,
-            langfuse.session.id = field::Empty,
-            langfuse.trace.name = field::Empty,
-            langfuse.user.id = field::Empty,
-            langfuse.trace.tags = field::Empty,
-            langfuse.environment = field::Empty,
-            langfuse.release = field::Empty,
-            langfuse.version = field::Empty,
-            langfuse.trace.public = field::Empty,
-            langfuse.trace.metadata = field::Empty,
-            gen_ai.client.base_url = field::Empty,
+            gen_ai.client.base_url = %self.api_url,
         );
-        span.record("gen_ai.system", "anthropic");
-        span.record("gen_ai.request.max_tokens", config.max_tokens as i64);
-        span.record("gen_ai.request.temperature", config.temperature);
-        span.record("gen_ai.client.base_url", self.api_url.as_str());
-
-        // Langfuse trace-level fields: record when enabled
-        if config.langfuse_enabled {
-            if let Some(ref val) = config.langfuse_session_id {
-                span.record("langfuse.session.id", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_trace_name {
-                span.record("langfuse.trace.name", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_user_id {
-                span.record("langfuse.user.id", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_tags {
-                span.record("langfuse.trace.tags", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_environment {
-                span.record("langfuse.environment", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_release {
-                span.record("langfuse.release", val.as_str());
-            }
-            if let Some(ref val) = config.langfuse_version {
-                span.record("langfuse.version", val.as_str());
-            }
-            if let Some(public) = config.langfuse_public {
-                span.record("langfuse.trace.public", public);
-            }
-            if let Some(ref metadata) = config.langfuse_metadata
-                && !metadata.is_empty()
-                && let Ok(json) = serde_json::to_string(metadata)
-            {
-                span.record("langfuse.trace.metadata", json.as_str());
-            }
-        }
 
         let base = self.api_url.trim_end_matches('/');
         let url = if is_versioned_base_url(base) {
