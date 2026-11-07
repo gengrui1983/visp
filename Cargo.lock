@@ -5524,6 +5524,7 @@ dependencies = [
  "visp-hooks",
  "visp-llm",
  "visp-mcp",
+ "visp-metrics",
  "visp-proto",
  "visp-tools",
 ]
@@ -5601,6 +5602,16 @@ dependencies = [
  "tracing",
  "visp-config",
  "visp-core",
+]
+
+[[package]]
+name = "visp-metrics"
+version = "0.5.4"
+dependencies = [
+ "dashmap",
+ "serial_test",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

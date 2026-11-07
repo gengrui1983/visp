@@ -15,10 +15,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
-use crate::observability::metrics_layer::MetricsLayer;
 use crate::observability::otlp;
 use crate::observability::parent_link::ParentLinkLayer;
 use visp_config::ObservabilityConfig;
+use visp_metrics::MetricsLayer;
 
 /// Output of [`init_observability`]; held for the lifetime of the program.
 #[allow(dead_code)]

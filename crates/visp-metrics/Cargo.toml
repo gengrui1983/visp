@@ -1,0 +1,13 @@
+[package]
+name = "visp-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dashmap = "5"
+
+[dev-dependencies]
+serial_test = "3"
