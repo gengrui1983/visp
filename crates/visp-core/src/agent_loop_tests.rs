@@ -167,6 +167,50 @@ async fn test_call_llm_with_retry_503_succeeds_after_retries() {
 
 #[serial]
 #[tokio::test]
+async fn test_call_llm_with_retry_emits_retry_event() {
+    let (spans, events) = setup_tracing();
+    let _guard = make_guard(&spans, &events);
+
+    let provider = Arc::new(ServerErrorProvider {
+        call_count: AtomicUsize::new(0),
+        fail_attempts: 2,
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = AgentLoopContext {
+        session_id: "test".into(),
+        history: vec![],
+        working_dir: PathBuf::from("/tmp"),
+        config: LlmConfig::default(),
+        cancel_token: cancel.clone(),
+        context_trimmer: Arc::new(NoopTrimmer),
+        global_tx: None,
+        permission_rules: None,
+        agent_kind: AgentKind::Primary,
+        depth: 0,
+        parent_session_id: "test".into(),
+    };
+    let cfg = AgentConfig {
+        llm_retry_attempts: 5,
+        llm_retry_base_delay_ms: 1,
+        ..Default::default()
+    };
+
+    let result = call_llm_with_retry(provider.as_ref(), &[], &[], &ctx, &cfg, "test").await;
+    assert!(result.is_ok(), "should succeed after retries");
+
+    let captured_events = events.lock().unwrap();
+    let retry_events = captured_events
+        .iter()
+        .filter(|e| *e == "gen_ai.client.retry")
+        .count();
+    assert_eq!(
+        retry_events, 2,
+        "expected one gen_ai.client.retry event per retry decision, got: {retry_events}"
+    );
+}
+
+#[serial]
+#[tokio::test]
 async fn test_call_llm_with_retry_503_exhausted() {
     let provider = Arc::new(ServerErrorProvider {
         call_count: AtomicUsize::new(0),

@@ -437,6 +437,22 @@ async fn call_llm_with_retry(
                     return Err(e);
                 }
                 let delay = cfg.llm_retry_base_delay_ms * (1u64 << attempt);
+                // gen_ai.client.retry：把重试决策发为可观测事件
+                //（重试循环在 visp-core 统一拥有，覆盖全部 provider，含 anthropic/openai）
+                let reason = match &e {
+                    LlmError::RateLimit { .. } => "rate_limit",
+                    LlmError::Network(_) => "network",
+                    LlmError::Api { .. } => "server_error",
+                    _ => "unknown",
+                };
+                tracing::warn!(
+                    target: "gen_ai.client.retry",
+                    session_id = %sid,
+                    attempt,
+                    reason,
+                    delay_ms = delay,
+                    "retrying LLM request"
+                );
                 // sleep 期间监听 cancel
                 tokio::select! {
                     biased;

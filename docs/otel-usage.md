@@ -151,7 +151,7 @@ agent 循环内三类 span（tool / run / iteration）统一由 **`init_span!` �
 | `visp.agent.completed` | `agent_loop.rs:1892` |
 | `gen_ai.client.first_token` | `anthropic.rs:861`、`openai.rs:871` |
 | `gen_ai.client.completed` | `anthropic.rs:969`、`openai.rs:1263` |
-| `gen_ai.client.retry` | `anthropic.rs:2556` |
+| `gen_ai.client.retry` | `visp-core/src/agent_loop.rs:441-456`（`call_llm_with_retry` 重试退避循环，唯一发出点，覆盖全部 provider；`reason` ∈ rate_limit/network/server_error，附 `attempt`/`delay_ms`） |
 | `gen_ai.client.error`（error 级） | `anthropic.rs:720, 733`、`openai.rs:1665, 1695, 1708` |
 | `visp.sse.anthropic` / `visp.sse.openai` | `anthropic.rs:1077`、`openai.rs:1116` |
 
