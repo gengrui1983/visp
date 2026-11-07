@@ -18,8 +18,6 @@ pub struct LangfuseSpanConfig {
     pub langfuse_enabled: bool,
     /// Langfuse session.id 覆盖值（Some 时优先于调用方传入的 session_id）
     pub langfuse_session_id: Option<String>,
-    /// Langfuse trace.name 字段值（None = 不设置）
-    pub langfuse_trace_name: Option<String>,
     /// Langfuse user.id 字段值（None = 不设置）
     pub langfuse_user_id: Option<String>,
     /// Langfuse tags 字段值（JSON 字符串，None = 不设置）
@@ -40,10 +38,10 @@ pub struct LangfuseSpanConfig {
 ///
 /// - 行为：创建 span，`tracing` 字段语法的立即字段原样透传给 `info_span!`；`langfuse_enabled` 守卫内记录 `langfuse.observation.type="span"` 并调用 `record_langfuse_trace_fields` 进行 langfuse 传播。
 /// - 固定字段集（三类并集）：公共具体值 `session_id`/`session.id`（取自 `$sid`）；延后 record 的 Empty 槽 `trace_id`/`parent_span_id`（ParentLinkLayer on_enter）、全部 `langfuse.*`、`level`/`status_message`/`visp.tool.*`。
-/// - 约束：调用方立即字段不得与上述集合重名（重名 = 同一 callsite 重复声明）；对未声明字段调用 `record()` 会被静默丢弃。`$cfg` 必须为 `&LangfuseSpanConfig`。
+/// - 约束：调用方立即字段不得与上述集合重名（重名 = 同一 callsite 重复声明）；对未声明字段调用 `record()` 会被静默丢弃。`$cfg` 必须为 `&LangfuseSpanConfig`；`$trace_name` 为 langfuse trace 名（空串 = 不记录）。
 #[macro_export]
 macro_rules! init_span {
-    ($cfg:expr, $sid:expr, $span_name:literal, $($field:tt)*) => {{
+    ($cfg:expr, $sid:expr, $trace_name:expr, $span_name:literal, $($field:tt)*) => {{
         let __span = tracing::info_span!(
             $span_name,
             session_id = $sid,
@@ -51,6 +49,7 @@ macro_rules! init_span {
             langfuse.session.id = tracing::field::Empty,
             trace_id = tracing::field::Empty,
             parent_span_id = tracing::field::Empty,
+            trace_state = tracing::field::Empty,
             langfuse.observation.type = tracing::field::Empty,
             langfuse.observation.input = tracing::field::Empty,
             langfuse.observation.output = tracing::field::Empty,
@@ -72,7 +71,7 @@ macro_rules! init_span {
         if $cfg.langfuse_enabled {
             __span.record("langfuse.observation.type", "span");
         }
-        $crate::span_init::record_langfuse_trace_fields(&__span, $cfg, $sid);
+        $crate::span_init::record_langfuse_trace_fields(&__span, $cfg, $sid, $trace_name);
         __span
     }};
 }
@@ -84,6 +83,7 @@ pub fn record_langfuse_trace_fields(
     span: &tracing::Span,
     cfg: &LangfuseSpanConfig,
     session_id: &str,
+    trace_name: &str,
 ) {
     if !cfg.langfuse_enabled {
         return;
@@ -93,8 +93,8 @@ pub fn record_langfuse_trace_fields(
     } else if !session_id.is_empty() {
         span.record("langfuse.session.id", session_id);
     }
-    if let Some(name) = cfg.langfuse_trace_name.as_deref() {
-        span.record("langfuse.trace.name", name);
+    if !trace_name.is_empty() {
+        span.record("langfuse.trace.name", trace_name);
     }
 
     if let Some(ref user_id) = cfg.langfuse_user_id {
@@ -128,7 +128,6 @@ impl From<&LlmConfig> for LangfuseSpanConfig {
         Self {
             langfuse_enabled: config.langfuse_enabled,
             langfuse_session_id: config.langfuse_session_id.clone(),
-            langfuse_trace_name: config.langfuse_trace_name.clone(),
             langfuse_user_id: config.langfuse_user_id.clone(),
             langfuse_tags: config.langfuse_tags.clone(),
             langfuse_environment: config.langfuse_environment.clone(),
@@ -154,7 +153,6 @@ mod tests {
         LangfuseSpanConfig {
             langfuse_enabled: true,
             langfuse_session_id: None,
-            langfuse_trace_name: Some("visp.agent.run".to_string()),
             langfuse_user_id: Some("user-1".to_string()),
             langfuse_tags: Some("[\"a\"]".to_string()),
             langfuse_environment: Some("prod".to_string()),
@@ -171,7 +169,7 @@ mod tests {
         let span =
             tracing::info_span!("disabled_test", langfuse.session.id = tracing::field::Empty);
         // Must not panic and must be a no-op.
-        record_langfuse_trace_fields(&span, &cfg, "session-1");
+        record_langfuse_trace_fields(&span, &cfg, "session-1", "visp.agent.run");
     }
 
     #[test]
@@ -190,7 +188,7 @@ mod tests {
             langfuse.trace.metadata = tracing::field::Empty,
         );
         // Recording all declared fields must not panic.
-        record_langfuse_trace_fields(&span, &cfg, "session-1");
+        record_langfuse_trace_fields(&span, &cfg, "session-1", "visp.agent.run");
     }
 
     #[test]
@@ -203,33 +201,38 @@ mod tests {
             langfuse.trace.name = tracing::field::Empty,
         );
         // cfg.langfuse_session_id takes precedence over the session_id argument.
-        record_langfuse_trace_fields(&span, &cfg, "arg-session");
+        record_langfuse_trace_fields(&span, &cfg, "arg-session", "visp.agent.run");
     }
 
     #[test]
-    fn test_record_langfuse_trace_name_none_skips() {
-        let mut cfg = full_cfg();
-        cfg.langfuse_trace_name = None;
+    fn test_record_langfuse_trace_name_empty_skips() {
+        let cfg = full_cfg();
         let span = tracing::info_span!(
-            "trace_name_none_test",
+            "trace_name_empty_test",
             langfuse.session.id = tracing::field::Empty,
             langfuse.trace.name = tracing::field::Empty,
         );
-        // Missing trace.name must be skipped without panicking.
-        record_langfuse_trace_fields(&span, &cfg, "session-1");
+        // Empty trace name must be skipped without panicking.
+        record_langfuse_trace_fields(&span, &cfg, "session-1", "");
     }
 
     #[test]
     fn test_init_span_macro_expands() {
         let cfg = LangfuseSpanConfig::default();
-        let span = init_span!(&cfg, "session-1", "macro_test", extra.field = "value");
+        let span = init_span!(
+            &cfg,
+            "session-1",
+            "visp.agent.run",
+            "macro_test",
+            extra.field = "value"
+        );
         let _ = span;
     }
 
     #[test]
     fn test_init_span_macro_expands_with_enabled_cfg() {
         let cfg = full_cfg();
-        let span = init_span!(&cfg, "session-1", "macro_enabled_test",);
+        let span = init_span!(&cfg, "session-1", "visp.agent.run", "macro_enabled_test",);
         let _ = span;
     }
 }

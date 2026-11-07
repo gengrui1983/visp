@@ -548,6 +548,7 @@ impl LlmProvider for AnthropicProvider {
         let span = init_span!(
             &lf_cfg,
             config.langfuse_session_id.as_deref().unwrap_or(""),
+            config.langfuse_trace_name.as_deref().unwrap_or(""),
             "gen_ai.client.operation",
             gen_ai.system = "anthropic",
             gen_ai.request.model = %config.model,

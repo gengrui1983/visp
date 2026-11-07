@@ -1184,6 +1184,7 @@ async fn execute_tool_calls(
         let tool_span = init_span!(
             &LangfuseSpanConfig::from(cfg),
             sid,
+            "visp.agent.run",
             "visp.tool.execute",
             gen_ai.tool.name = %tool_span_name,
             gen_ai.tool.call.id = %tool_span_id,
@@ -1613,6 +1614,7 @@ pub async fn run_agent_loop(
         &lf_cfg,
         &sid,
         "visp.agent.run",
+        "visp.agent.run",
         session.short_id = %short_id,
         gen_ai.provider.name = %provider_name,
         visp.agent.kind = %ctx.agent_kind,
@@ -1719,6 +1721,7 @@ pub async fn run_agent_loop(
             let iteration_span = init_span!(
                 &lf_cfg,
                 &sid,
+                "visp.agent.run",
                 "visp.agent.iteration",
                 visp.span.w3c_id = &iter_span_w3c_id,
                 iteration.count = iteration,

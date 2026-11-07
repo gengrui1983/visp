@@ -1511,6 +1511,7 @@ impl LlmProvider for OpenAiProvider {
         let span = init_span!(
             &lf_cfg,
             config.langfuse_session_id.as_deref().unwrap_or(""),
+            config.langfuse_trace_name.as_deref().unwrap_or(""),
             "gen_ai.client.operation",
             gen_ai.system = "openai",
             gen_ai.request.model = %config.model,

@@ -39,7 +39,7 @@ use visp_hooks::{
     StopFailurePayload, StopPayload, StopStatus, UserPromptSubmitPayload, VISP_HOOK_SCHEMA,
 };
 
-use visp_observability::LangfuseSpanConfig;
+use visp_observability::{LangfuseSpanConfig, init_span};
 
 use crate::active_agent::{ActiveAgent, ActiveAgentRegistry};
 
@@ -937,7 +937,10 @@ impl Orchestrator {
         }
 
         // ── W1-S3c: 创建 visp.subagent.spawn span ─────────────────────────
-        let spawn_span = tracing::info_span!(
+        let spawn_span = init_span!(
+            &LangfuseSpanConfig::from(&self.agent_config),
+            parent_session_id,
+            "visp.agent.run",
             "visp.subagent.spawn",
             visp.subagent.name = %subagent_type,
             visp.subagent.session_id = %sub_session_id,
@@ -945,19 +948,6 @@ impl Orchestrator {
             visp.subagent.task_id = tracing::field::Empty,
             visp.subagent.depth = depth,
             visp.agent.parent_session_id = %ctx.parent_session_id,
-            trace_id = tracing::field::Empty,
-            parent_span_id = tracing::field::Empty,
-            trace_state = tracing::field::Empty,
-            // Langfuse trace-level fields
-            langfuse.session.id = tracing::field::Empty,
-            langfuse.user.id = tracing::field::Empty,
-            langfuse.trace.tags = tracing::field::Empty,
-            langfuse.trace.name = tracing::field::Empty,
-            langfuse.environment = tracing::field::Empty,
-            langfuse.release = tracing::field::Empty,
-            langfuse.version = tracing::field::Empty,
-            langfuse.trace.public = tracing::field::Empty,
-            langfuse.trace.metadata = tracing::field::Empty,
         );
 
         // W2-S5: Rebuild OTel parent Context from TraceContext and set it
@@ -980,14 +970,6 @@ impl Orchestrator {
                 spawn_span.record("trace_state", ts.as_str());
             }
         }
-
-        // 记录 Langfuse trace 级字段（仅 enabled 时写入）
-        // 使用 parent_session_id 确保同 trace 内的 session/name 一致
-        visp_observability::record_langfuse_trace_fields(
-            &spawn_span,
-            &LangfuseSpanConfig::from(&self.agent_config),
-            parent_session_id,
-        );
 
         // 记录 task_id（Risk R1：前移到 tokio::spawn 之前）
         if let Some(task_id) = _task_id {
