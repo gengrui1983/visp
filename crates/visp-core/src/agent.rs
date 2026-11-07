@@ -492,7 +492,11 @@ impl From<&AgentConfig> for LangfuseSpanConfig {
             langfuse_trace_name: Some("visp.agent.run".to_string()),
             langfuse_user_id: cfg.langfuse_user_id.clone(),
             langfuse_tags: cfg.langfuse_tags.clone(),
-            langfuse_environment: cfg.langfuse_environment.clone(),
+            langfuse_environment: Some(
+                cfg.langfuse_environment
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            ),
             langfuse_release: cfg.langfuse_release.clone(),
             langfuse_version: cfg.langfuse_version.clone(),
             langfuse_public: cfg.langfuse_public,

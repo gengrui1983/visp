@@ -103,8 +103,9 @@ pub fn record_langfuse_trace_fields(
     if let Some(ref tags) = cfg.langfuse_tags {
         span.record("langfuse.trace.tags", tags.as_str());
     }
-    let env = cfg.langfuse_environment.as_deref().unwrap_or("default");
-    span.record("langfuse.environment", env);
+    if let Some(env) = cfg.langfuse_environment.as_deref() {
+        span.record("langfuse.environment", env);
+    }
     if let Some(ref release) = cfg.langfuse_release {
         span.record("langfuse.release", release.as_str());
     }
