@@ -76,6 +76,33 @@ fn test_selection_reversed_coords() {
 }
 
 #[test]
+fn test_selection_not_rectangle_across_lines() {
+    // 回归：先在第 1 行从 col 20 拖到行尾，再在第 2 行向左拖到 col 10。
+    // 选区不是矩形：第 1 行应从 col 20 开始（而不是 min(10,20)=10）。
+    let sel = TextSelection {
+        start: Some((20, 1)),
+        end: Some((10, 2)),
+    };
+    // 首行（row 1，start 所在行）：col >= 20
+    assert!(!sel.contains(19, 1, 0));
+    assert!(sel.contains(20, 1, 0));
+    assert!(sel.contains(50, 1, 0));
+    // 末行（row 2，end 所在行）：col <= 10
+    assert!(sel.contains(0, 2, 0));
+    assert!(sel.contains(10, 2, 0));
+    assert!(!sel.contains(11, 2, 0));
+    // 反向拖拽（先下后上）同样成立
+    let rev = TextSelection {
+        start: Some((10, 2)),
+        end: Some((20, 1)),
+    };
+    assert!(!rev.contains(19, 1, 0));
+    assert!(rev.contains(20, 1, 0));
+    assert!(rev.contains(10, 2, 0));
+    assert!(!rev.contains(11, 2, 0));
+}
+
+#[test]
 fn test_selection_clear() {
     let mut sel = TextSelection {
         start: Some((0, 0)),

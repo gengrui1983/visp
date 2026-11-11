@@ -31,11 +31,19 @@ impl TextSelection {
         self.end = None;
     }
 
-    /// 返回选择矩形区域 (min_col, min_row, max_col, max_row) - 内容坐标
+    /// 返回按**行语义**归一化的选区 (first_row, first_row_start_col, last_row, last_row_end_col)
+    /// - 内容坐标
+    /// - 注意：跨行选区不是矩形！首行的起始列取"位于首行的那个端点"的列，
+    ///   末行的结束列取"位于末行的那个端点"的列。否则先在首行向右拖、
+    ///   再到下一行向左拖时，首行会多涂一段（min/max 矩形语义的 bug）。
     fn bounds(&self) -> Option<(u16, u16, u16, u16)> {
         let (sc, sr) = self.start?;
         let (ec, er) = self.end?;
-        Some((sc.min(ec), sr.min(er), sc.max(ec), sr.max(er)))
+        if (sr, sc) <= (er, ec) {
+            Some((sr, sc, er, ec))
+        } else {
+            Some((er, ec, sr, sc))
+        }
     }
 
     /// 判断某个**屏幕坐标**是否在选择范围内。
@@ -44,21 +52,21 @@ impl TextSelection {
         if !self.is_active() {
             return false;
         }
-        let (min_c, min_r, max_c, max_r) = match self.bounds() {
+        let (fr, fc, lr, lc) = match self.bounds() {
             Some(b) => b,
             None => return false,
         };
         // 屏幕坐标 -> 内容坐标
         let row = screen_row + scroll_y;
-        if row < min_r || row > max_r {
+        if row < fr || row > lr {
             return false;
         }
-        if min_r == max_r {
-            col >= min_c && col <= max_c
-        } else if row == min_r {
-            col >= min_c
-        } else if row == max_r {
-            col <= max_c
+        if fr == lr {
+            col >= fc && col <= lc
+        } else if row == fr {
+            col >= fc
+        } else if row == lr {
+            col <= lc
         } else {
             true
         }
@@ -197,14 +205,14 @@ pub fn extract_selected_text(
     if !selection.is_active() {
         return String::new();
     }
-    let (min_c, min_r, max_c, max_r) = match selection.bounds() {
+    let (fr, fc, lr, lc) = match selection.bounds() {
         Some(b) => b,
         None => return String::new(),
     };
 
     // 内容坐标 -> 屏幕坐标
-    let min_r_screen = min_r.saturating_sub(scroll_y);
-    let max_r_screen = max_r.saturating_sub(scroll_y);
+    let min_r_screen = fr.saturating_sub(scroll_y);
+    let max_r_screen = lr.saturating_sub(scroll_y);
 
     // 统一裁剪到聊天区：最右 1 列是滚动条轨道，永不复制
     let min_r_screen = min_r_screen.max(chat_area.y);
@@ -228,8 +236,8 @@ pub fn extract_selected_text(
         let mut line = String::new();
         let is_first = row == min_r_screen;
         let is_last = row == max_r_screen;
-        let col_start = (if is_first { min_c } else { 0 }).max(col_lo);
-        let col_end = (if is_last { max_c } else { scroll_col_hi }).min(col_hi);
+        let col_start = (if is_first { fc } else { 0 }).max(col_lo);
+        let col_end = (if is_last { lc } else { scroll_col_hi }).min(col_hi);
 
         if col_start > col_end {
             continue;
