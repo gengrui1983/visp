@@ -5355,6 +5355,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic 0.13.1",
  "visp-config",

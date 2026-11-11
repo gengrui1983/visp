@@ -9,6 +9,7 @@ chrono.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml = "0.8"
+tokio-stream.workspace = true
 tonic.workspace = true
 visp-proto = { path = "../visp-proto" }
 visp-config = { path = "../visp-config" }

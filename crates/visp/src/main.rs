@@ -7,24 +7,25 @@ use visp_proto::visp::ShutdownRequest;
 use visp_proto::visp::coder_daemon_client::CoderDaemonClient;
 
 mod hook_cmd;
+mod run_cmd;
 
 /// visp launcher — starts daemon + CLI in one command
 #[derive(Parser)]
 #[command(name = "visp")]
 struct Cli {
-    #[arg(short = 'p', long, default_value = ".")]
+    #[arg(short = 'p', long, default_value = ".", global = true)]
     project: String,
 
     #[arg(short = 'a', long, default_value = "[::1]:50051")]
     addr: String,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     temperature: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     thinking_budget: Option<u32>,
 
     #[arg(short = 's', long)]
@@ -32,7 +33,7 @@ struct Cli {
 
     /// Custom global config directory (overrides ~/.config/visp).
     /// Passed to the daemon as --config-dir.
-    #[arg(long)]
+    #[arg(long, global = true)]
     config_dir: Option<String>,
 
     /// Do not spawn any hook process; only match and print.
@@ -50,6 +51,18 @@ enum LauncherCommand {
     Hooks {
         #[command(subcommand)]
         action: HooksAction,
+    },
+    /// Run one prompt non-interactively and exit (for scripts / CI).
+    ///
+    /// The answer is printed on stdout, progress on stderr. The prompt is
+    /// taken from the arguments, or from stdin when none (or "-") is given.
+    /// Exit code: 0 done, 1 agent error, 3 daemon stream lost, 130 interrupted.
+    Run {
+        /// Approve every tool request once (without it, all are denied).
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// The prompt (or "-" / nothing to read it from stdin).
+        prompt: Vec<String>,
     },
 }
 
@@ -80,89 +93,22 @@ async fn main() {
         unsafe { std::env::set_var("VISP_CONFIG_DIR", dir) };
     }
 
+    // `visp run ...`: one prompt, no TUI.
+    if let Some(LauncherCommand::Run { yes, prompt }) = &cli.command {
+        let code = run_once(&cli, *yes, prompt).await;
+        std::process::exit(code);
+    }
+
     // `visp hooks ...`: inspect hooks without launching the daemon/TUI.
     if let Some(ref command) = cli.command {
         let code = run_subcommand(command, &cli).await;
         std::process::exit(code);
     }
 
-    // Resolve sibling binary paths (same dir as launcher for cargo run, or PATH)
-    let daemon_bin = resolve_bin("visp-daemon");
-    let cli_bin = resolve_bin("visp-tui");
-
-    // 1. Create log directory
-    let log_dir = visp_config::path::log_dir().unwrap_or_else(|| PathBuf::from("."));
-    tokio::fs::create_dir_all(&log_dir)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to create log directory {}: {e}", log_dir.display());
-            std::process::exit(1);
-        });
-
-    // 2. Prepare daemon log file
-    let timestamp = format_timestamp();
-    let log_path = log_dir.join(format!("daemon-{timestamp}.log"));
-    let log_file = tokio::fs::File::create(&log_path)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to create log file {}: {e}", log_path.display());
-            std::process::exit(1);
-        });
-    let log_file_stdout = log_file.try_clone().await.unwrap();
-    let log_file_stderr = log_file.try_clone().await.unwrap();
-
-    // 3. Find an available port for the daemon.
-    let addr = find_available_addr(&cli.addr).unwrap_or_else(|e| {
-        eprintln!("[visp] {e}");
+    let Some((mut daemon, addr)) = start_daemon(&cli).await else {
         std::process::exit(1);
-    });
-    eprintln!("[visp] Daemon will listen on {addr}");
-
-    // 4. Start daemon, passing the selected address via env var.
-    eprintln!("[visp] Starting daemon (log: {})...", log_path.display());
-    let mut daemon_cmd = Command::new(&daemon_bin);
-    daemon_cmd
-        .env("VISP_LISTEN_ADDR", &addr)
-        .stdout(log_file_stdout.into_std().await)
-        .stderr(log_file_stderr.into_std().await);
-    // Forward --config-dir if specified.
-    if let Some(ref dir) = cli.config_dir {
-        daemon_cmd.arg("--config-dir").arg(dir);
-    }
-    let mut daemon = match daemon_cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("[visp] Failed to start daemon: {e}");
-            eprintln!("[visp] Make sure 'visp-daemon' is built. Try: cargo build");
-            std::process::exit(1);
-        }
     };
-
-    // 5. Health check with timeout
-    eprintln!("[visp] Waiting for daemon to be ready...");
-    let health_ok =
-        tokio::time::timeout(std::time::Duration::from_secs(15), wait_for_health(&addr)).await;
-
-    match health_ok {
-        Ok(true) => eprintln!("[visp] Daemon is ready."),
-        Ok(false) | Err(_) => {
-            // Daemon failed to start. Check if it wrote a startup error message.
-            if let Some(err_file) = visp_config::path::startup_error_file()
-                && let Ok(msg) = std::fs::read_to_string(&err_file)
-                && !msg.is_empty()
-            {
-                // Print in red
-                eprintln!("\x1b[31m{msg}\x1b[0m");
-                let _ = std::fs::remove_file(&err_file);
-            } else if health_ok.is_err() {
-                eprintln!("[visp] Daemon did not become ready within 15s.");
-            } else {
-                eprintln!("[visp] Daemon health check failed.");
-            }
-            kill_daemon(&mut daemon).await;
-            std::process::exit(1);
-        }
-    }
+    let cli_bin = resolve_bin("visp-tui");
 
     // 6. Build CLI args
     let mut cli_args = vec![
@@ -229,12 +175,221 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
+/// Steps 1-5 shared by the TUI launcher and `visp run`: log file, free port,
+/// spawn `visp-daemon`, wait for its health check. `None` = failed (already
+/// reported on stderr, daemon killed).
+async fn start_daemon(cli: &Cli) -> Option<(Child, String)> {
+    // Resolve sibling binary paths (same dir as launcher for cargo run, or PATH)
+    let daemon_bin = resolve_bin("visp-daemon");
+
+    // 1. Create log directory
+    let log_dir = visp_config::path::log_dir().unwrap_or_else(|| PathBuf::from("."));
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create log directory {}: {e}", log_dir.display());
+            std::process::exit(1)
+        });
+
+    // 2. Prepare daemon log file
+    let timestamp = format_timestamp();
+    let log_path = log_dir.join(format!("daemon-{timestamp}.log"));
+    let log_file = tokio::fs::File::create(&log_path)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create log file {}: {e}", log_path.display());
+            std::process::exit(1)
+        });
+    let log_file_stdout = log_file.try_clone().await.unwrap();
+    let log_file_stderr = log_file.try_clone().await.unwrap();
+
+    // 3. Find an available port for the daemon.
+    let addr = find_available_addr(&cli.addr).unwrap_or_else(|e| {
+        eprintln!("[visp] {e}");
+        std::process::exit(1);
+    });
+    eprintln!("[visp] Daemon will listen on {addr}");
+
+    // 4. Start daemon, passing the selected address via env var.
+    eprintln!("[visp] Starting daemon (log: {})...", log_path.display());
+    let mut daemon_cmd = Command::new(&daemon_bin);
+    daemon_cmd
+        .env("VISP_LISTEN_ADDR", &addr)
+        .stdout(log_file_stdout.into_std().await)
+        .stderr(log_file_stderr.into_std().await);
+    // Forward --config-dir if specified.
+    if let Some(ref dir) = cli.config_dir {
+        daemon_cmd.arg("--config-dir").arg(dir);
+    }
+    let mut daemon = match daemon_cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("[visp] Failed to start daemon: {e}");
+            eprintln!("[visp] Make sure 'visp-daemon' is built. Try: cargo build");
+            return None;
+        }
+    };
+
+    // 5. Health check with timeout
+    eprintln!("[visp] Waiting for daemon to be ready...");
+    let health_ok =
+        tokio::time::timeout(std::time::Duration::from_secs(15), wait_for_health(&addr)).await;
+
+    match health_ok {
+        Ok(true) => eprintln!("[visp] Daemon is ready."),
+        Ok(false) | Err(_) => {
+            // Daemon failed to start. Check if it wrote a startup error message.
+            if let Some(err_file) = visp_config::path::startup_error_file()
+                && let Ok(msg) = std::fs::read_to_string(&err_file)
+                && !msg.is_empty()
+            {
+                // Print in red
+                eprintln!("\x1b[31m{msg}\x1b[0m");
+                let _ = std::fs::remove_file(&err_file);
+            } else if health_ok.is_err() {
+                eprintln!("[visp] Daemon did not become ready within 15s.");
+            } else {
+                eprintln!("[visp] Daemon health check failed.");
+            }
+            kill_daemon(&mut daemon).await;
+            return None;
+        }
+    }
+
+    Some((daemon, addr))
+}
+
+/// `visp run`: start the daemon, run one prompt, shut the daemon down.
+async fn run_once(cli: &Cli, approve: bool, words: &[String]) -> i32 {
+    use visp_proto::visp::{CreateSessionRequest, LlmConfig};
+
+    if cli.session.is_some() {
+        eprintln!("[visp run] --session is not supported yet; each run starts a new session");
+        return 2;
+    }
+    let prompt = match run_cmd::resolve_prompt(words, std::io::stdin()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[visp run] {e}");
+            return 2;
+        }
+    };
+
+    let Some((mut daemon, addr)) = start_daemon(cli).await else {
+        return 1;
+    };
+
+    let outcome =
+        async {
+            let mut client = CoderDaemonClient::connect(format!("http://{addr}"))
+                .await
+                .map_err(|e| format!("connect daemon: {e}"))?;
+
+            // Same session config as the TUI's new-session path.
+            let mut extra = std::collections::HashMap::new();
+            if let Some(budget) = cli.thinking_budget {
+                extra.insert("thinking_budget_tokens".into(), budget.to_string());
+            }
+            let config = (cli.model.is_some() || cli.temperature.is_some() || !extra.is_empty())
+                .then(|| LlmConfig {
+                    model: cli.model.clone(),
+                    model_key: None,
+                    temperature: cli.temperature,
+                    max_tokens: None,
+                    max_context_tokens: None,
+                    extra,
+                });
+            let project = PathBuf::from(&cli.project);
+            let project = project.canonicalize().unwrap_or(project);
+            let session_id = client
+                .create_session(CreateSessionRequest {
+                    project_path: project.to_string_lossy().to_string(),
+                    config,
+                })
+                .await
+                .map_err(|e| format!("create session: {e}"))?
+                .into_inner()
+                .session_id;
+
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+            let mut stream = client
+                .chat(tokio_stream::wrappers::ReceiverStream::new(out_rx))
+                .await
+                .map_err(|e| format!("chat stream: {e}"))?
+                .into_inner();
+            let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(256);
+            tokio::spawn(async move {
+                while let Ok(Some(m)) = stream.message().await {
+                    if in_tx.send(m).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            out_tx
+                .send(run_cmd::user_input(&session_id, &prompt))
+                .await
+                .map_err(|_| "chat stream closed before the prompt was sent".to_string())?;
+
+            let mut stats = run_cmd::RunStats::default();
+            let started = std::time::Instant::now();
+            let outcome = run_cmd::drive(
+                &mut in_rx,
+                &out_tx,
+                &session_id,
+                approve,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+                &mut stats,
+            )
+            .await;
+            eprintln!(
+                "[visp run] {:?} in {:.0}s: {} tool calls, approvals {} granted / {} denied, \
+             tokens (all agents) in {} / out {}",
+                outcome,
+                started.elapsed().as_secs_f64(),
+                stats.tool_calls,
+                stats.approvals_granted,
+                stats.approvals_denied,
+                stats.input_tokens,
+                stats.output_tokens
+            );
+            Ok::<_, String>(outcome)
+        }
+        .await;
+
+    let code = match outcome {
+        Ok(o) => {
+            if let run_cmd::RunOutcome::AgentError { code, message } = &o {
+                eprintln!("[visp run] agent error {code}: {message}");
+            }
+            o.exit_code()
+        }
+        Err(e) => {
+            eprintln!("[visp run] {e}");
+            1
+        }
+    };
+    let _ = shutdown_and_wait(
+        &mut daemon,
+        std::time::Duration::from_secs(5),
+        send_shutdown(&addr),
+    )
+    .await;
+    code
+}
+
 /// Dispatch launcher subcommands; returns the process exit code.
 async fn run_subcommand(command: &LauncherCommand, cli: &Cli) -> i32 {
     match command {
         LauncherCommand::Hooks { action } => {
             hook_cmd::run(action, Path::new(&cli.project), &cli.addr, cli.dry_run).await
         }
+        // Handled in main() before this dispatcher (it needs the daemon).
+        LauncherCommand::Run { .. } => unreachable!("visp run is dispatched in main"),
     }
 }
 
