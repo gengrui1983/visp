@@ -906,6 +906,11 @@ pub fn load_config(config_path: Option<&Path>) -> Result<DaemonConfig, String> {
     if let Ok(level) = std::env::var("RUST_LOG") {
         config.daemon.log_level = level;
     }
+    //    api_key = "${VAR}" -> 展开为环境变量 VAR（docs/daemon.example.toml 就是这样写的）；
+    //    VAR 未设置或为空时视为未配置，交给下面的 OPENAI_API_KEY / ANTHROPIC_API_KEY 回填。
+    for model in &mut config.llm.models {
+        expand_api_key_env(model);
+    }
     //    OPENAI_API_KEY -> 回填 openai 模型的 api_key（仅当该模型未配置 api_key）
     if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
         for model in &mut config.llm.models {
@@ -924,6 +929,33 @@ pub fn load_config(config_path: Option<&Path>) -> Result<DaemonConfig, String> {
     }
 
     Ok(config)
+}
+
+/// 若 `value` 整体是 `${NAME}` 形式的环境变量引用，返回 `NAME`。
+fn env_var_reference(value: &str) -> Option<&str> {
+    let name = value.trim().strip_prefix("${")?.strip_suffix('}')?;
+    let valid = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(name)
+}
+
+/// 展开 `api_key = "${NAME}"`。以前这串字面量会原样作为 key 发给 provider（401），
+/// 且因为 api_key 非空，环境变量回填也不会生效。
+fn expand_api_key_env(model: &mut LlmModelConfig) {
+    let Some(name) = model.api_key.as_deref().and_then(env_var_reference) else {
+        return;
+    };
+    let name = name.to_string();
+    match std::env::var(&name) {
+        Ok(value) if !value.is_empty() => model.api_key = Some(value),
+        _ => {
+            tracing::warn!(
+                model = %model.name,
+                var = %name,
+                "api_key references an unset environment variable; treating it as not configured"
+            );
+            model.api_key = None;
+        }
+    }
 }
 
 /// 判断模型是否匹配给定的 provider 关键字：protocol 相等，或 provider 字段包含关键字（大小写不敏感）。
@@ -2228,6 +2260,72 @@ model = "claude-sonnet-4-20250514"
         );
         // anthropic 模型不应被 openai key 回填
         assert_eq!(config.llm.models[1].api_key, None);
+    }
+
+    const ENV_REF_TOML: &str = r#"
+[daemon]
+listen_addr = "[::1]:50051"
+
+[llm]
+[[llm.models]]
+name = "DeepSeek"
+protocol = "openai"
+model = "deepseek-chat"
+api_key = "${VISP_TEST_REF_KEY}"
+
+[[llm.models]]
+name = "Literal"
+protocol = "openai"
+model = "gpt-4o"
+api_key = "sk-literal"
+
+[tools]
+
+[agent]
+"#;
+
+    #[test]
+    #[serial]
+    fn test_api_key_env_reference_is_expanded() {
+        let config =
+            run_load_config_with_env(ENV_REF_TOML, &[("VISP_TEST_REF_KEY", Some("sk-from-env"))])
+                .unwrap();
+        // safety: 测试中单线程执行（#[serial]）
+        unsafe { std::env::remove_var("VISP_TEST_REF_KEY") };
+        assert_eq!(config.llm.models[0].api_key.as_deref(), Some("sk-from-env"));
+        assert_eq!(config.llm.models[1].api_key.as_deref(), Some("sk-literal"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_key_env_reference_unset_falls_back_to_provider_env() {
+        let config = run_load_config_with_env(
+            ENV_REF_TOML,
+            &[
+                ("VISP_TEST_REF_KEY", None),
+                ("OPENAI_API_KEY", Some("sk-openai-fallback")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            config.llm.models[0].api_key.as_deref(),
+            Some("sk-openai-fallback"),
+            "an unset ${{VAR}} must not be sent literally; it falls back like a missing api_key"
+        );
+        assert_eq!(config.llm.models[1].api_key.as_deref(), Some("sk-literal"));
+    }
+
+    #[test]
+    fn test_env_var_reference_parsing() {
+        assert_eq!(
+            env_var_reference("${OPENAI_API_KEY}"),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(env_var_reference(" ${K1} "), Some("K1"));
+        assert_eq!(env_var_reference("sk-abc"), None);
+        assert_eq!(env_var_reference("${}"), None);
+        assert_eq!(env_var_reference("${A-B}"), None);
+        assert_eq!(env_var_reference("prefix-${A}"), None);
     }
 
     #[test]
