@@ -52,6 +52,51 @@ fn test_build_messages_simple() {
 }
 
 #[test]
+fn test_build_messages_mid_conversation_system_becomes_user() {
+    // 上下文裁剪 / doom-loop 守卫会在历史中间插入 system 消息;
+    // Qwen 等模型的 chat template 只允许 system 在开头,否则 400
+    // "System message must be at the beginning."
+    let msgs = vec![
+        Message::system("You are a helpful assistant."),
+        Message::user("Find the bug."),
+        Message::system("[... earlier messages omitted due to context limit ...]"),
+        Message::assistant("Looking."),
+        Message::system("You appear to be repeating the same tool calls."),
+    ];
+    let result = build_openai_messages(&msgs);
+    assert_eq!(result.len(), 5);
+    assert_eq!(result[0]["role"], "system");
+    assert_eq!(result[0]["content"], "You are a helpful assistant.");
+    for (i, m) in result.iter().enumerate().skip(1) {
+        assert_ne!(m["role"], "system", "message {i} must not be system");
+    }
+    assert_eq!(result[2]["role"], "user");
+    assert_eq!(
+        result[2]["content"],
+        "[System notice] [... earlier messages omitted due to context limit ...]"
+    );
+    assert_eq!(result[4]["role"], "user");
+    assert_eq!(
+        result[4]["content"],
+        "[System notice] You appear to be repeating the same tool calls."
+    );
+}
+
+#[test]
+fn test_build_messages_leading_system_messages_kept() {
+    // 开头连续的多条 system 仍保持 system(位置合法)
+    let msgs = vec![
+        Message::system("A"),
+        Message::system("B"),
+        Message::user("hi"),
+    ];
+    let result = build_openai_messages(&msgs);
+    assert_eq!(result[0]["role"], "system");
+    assert_eq!(result[1]["role"], "system");
+    assert_eq!(result[2]["role"], "user");
+}
+
+#[test]
 fn test_build_openai_messages_with_images() {
     use visp_core::message::ImageData;
     let mut msg = Message::user("这是什么？");

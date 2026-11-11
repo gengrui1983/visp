@@ -321,9 +321,24 @@ pub fn build_openai_messages_with_policy(
 /// 基础消息构建（不含 reasoning 补齐策略）。
 fn build_openai_messages_raw(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut result: Vec<serde_json::Value> = Vec::new();
+    // 是否已出现过非 system 消息。之后再遇到的 system(上下文裁剪的省略提示、
+    // doom-loop 守卫提示等)改为 user 角色原位发送:Qwen 等模型的 chat template
+    // 只接受开头的 system,否则 400 "System message must be at the beginning."。
+    // 保持原位(而不是像 anthropic 那样合并进 system prompt),既保留提示的位置语义,
+    // 也不改变 system prompt 前缀,不破坏服务端前缀缓存。
+    let mut seen_non_system = false;
 
     for msg in messages {
+        if msg.role != Role::System {
+            seen_non_system = true;
+        }
         match msg.role {
+            Role::System if seen_non_system => {
+                result.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("[System notice] {}", msg.content),
+                }));
+            }
             Role::System => {
                 result.push(serde_json::json!({
                     "role": "system",
