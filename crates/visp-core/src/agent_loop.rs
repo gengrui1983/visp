@@ -32,6 +32,17 @@ const APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// 明确失败，不再续跑。
 const MAX_CONSECUTIVE_THINKING_ONLY: u32 = 3;
 
+/// 最终回答（有正文、无工具调用）因 max_tokens 被截断时，自动续写的次数上限。
+///
+/// 截断的回答以前被当作正常结束（ACP `end_turn`），调用方无从得知结论不完整；
+/// 退化输出（同一句重复到 max_tokens）也会被当成结论。现在先续写一次，
+/// 仍被截断则明确报错。
+const MAX_TRUNCATED_CONTINUATIONS: u32 = 1;
+
+/// 续写时插入的提示（与 doom-loop 提示同样以 system 消息进入历史）。
+const TRUNCATION_CONTINUE_NOTICE: &str = "Your previous reply was cut off by the max_tokens limit. \
+Continue exactly where it stopped without repeating earlier text, and keep the rest concise.";
+
 use crate::rules::RuleEngine;
 use crate::session::SessionManager;
 use crate::session::SessionStatus;
@@ -623,6 +634,9 @@ enum StreamDecision {
     /// 仅思考、无正文/工具（provider 明确结束了一轮），按既有语义继续循环，
     /// 但由调用方对其连续次数计数以触发 F5 上限。
     ThinkingOnly,
+    /// 有正文、无工具调用，但 provider 报告 length/max_tokens：回答被截断，
+    /// 不能当作完成。正文已写入历史；由调用方决定续写或报错。
+    Truncated,
 }
 
 /// provider 元数据是否声称本轮以工具调用结束。
@@ -976,6 +990,17 @@ async fn handle_stream_result(
                 let _ = sm.finish_loop(sid, SessionStatus::Error);
                 return Err(());
             }
+        }
+
+        if is_token_limit && !text_buffer.is_empty() {
+            tracing::warn!(
+                session_id = %sid,
+                text_len = text_buffer.len(),
+                output_tokens,
+                finish_reasons = ?provider_metadata.as_ref().map(|m| &m.finish_reasons),
+                "final answer truncated by max_tokens; not treating it as completed"
+            );
+            return Ok(StreamDecision::Truncated);
         }
 
         // Send usage info and Done
@@ -1708,6 +1733,8 @@ pub async fn run_agent_loop(
         // F5：连续 thinking-only 轮次计数。进入 thinking-only 分支 +1，任何
         // 非 thinking-only 的轮次清零；超过 MAX_CONSECUTIVE_THINKING_ONLY 即中止。
         let mut consecutive_thinking_only: u32 = 0;
+        // 连续被 max_tokens 截断的最终回答次数（见 MAX_TRUNCATED_CONTINUATIONS）。
+        let mut consecutive_truncated: u32 = 0;
         let mut doom_loop_window: Vec<Vec<(String, serde_json::Value)>> = Vec::new();
         let mut doom_loop_warned = false;
         loop {
@@ -1909,9 +1936,46 @@ pub async fn run_agent_loop(
                     consecutive_thinking_only = 0;
                     continue;
                 }
+                Ok(StreamDecision::Truncated) => {
+                    consecutive_thinking_only = 0;
+                    consecutive_truncated += 1;
+                    if consecutive_truncated > MAX_TRUNCATED_CONTINUATIONS {
+                        tracing::error!(
+                            session_id = %sid,
+                            consecutive_truncated,
+                            iteration,
+                            "final answer still truncated by max_tokens after continuation; aborting"
+                        );
+                        let _ = send_event(
+                            &tx,
+                            &sm,
+                            &sid,
+                            &ctx.global_tx,
+                            &ctx.session_id,
+                            AgentEvent::Error {
+                                code: AgentErrorCode::LlmApi,
+                                message: format!(
+                                    "回答连续 {consecutive_truncated} 次在 max_tokens 处被截断，结论不完整（可调大 max_tokens，或检查模型是否在重复输出）"
+                                ),
+                            },
+                        )
+                        .await;
+                        let _ = sm.finish_loop(&sid, SessionStatus::Error);
+                        return;
+                    }
+                    tracing::info!(
+                        session_id = %sid,
+                        iteration,
+                        consecutive_truncated,
+                        "run_agent_loop: final answer truncated, asking the model to continue"
+                    );
+                    ctx.history.push(Message::system(TRUNCATION_CONTINUE_NOTICE));
+                    // 无工具调用：下面的执行步骤会被跳过，直接进入下一轮。
+                }
                 Ok(StreamDecision::Continue) => {
                     // 有真实工具调用：清零连续 thinking-only 计数。
                     consecutive_thinking_only = 0;
+                    consecutive_truncated = 0;
                     tracing::info!(
                         session_id = %sid,
                         iteration,

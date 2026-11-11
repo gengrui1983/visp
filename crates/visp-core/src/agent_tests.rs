@@ -1464,6 +1464,90 @@ async fn test_thinking_only_with_length_continues_loop() {
     );
 }
 
+fn length_metadata() -> crate::ProviderMetadata {
+    crate::ProviderMetadata {
+        model: "test".into(),
+        finish_reasons: vec!["length".into()],
+        input_tokens: 100,
+        output_tokens: 4096,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        latency_ms: 500,
+    }
+}
+
+/// A final answer (text, no tool calls) cut off by max_tokens must not be
+/// reported as a completed turn: the loop asks the model to continue once.
+#[tokio::test]
+async fn test_truncated_final_answer_is_continued() {
+    let provider: StdArc<dyn LlmProvider> = StdArc::new(TestProvider::new(vec![
+        vec![
+            ChatEvent::TextDelta("Root cause: the OCR serv".into()),
+            ChatEvent::OutputMetadata(length_metadata()),
+            ChatEvent::Done,
+        ],
+        vec![
+            ChatEvent::TextDelta("ice crashed at 20:59.".into()),
+            ChatEvent::Done,
+        ],
+    ]));
+
+    let (events, _sm, _sid) =
+        run_collect(provider, vec![], test_setup(), 10, 200, Message::user("Hi")).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "a single truncation should be recovered by continuing, not an error"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("crashed at 20:59"))),
+        "expected the continuation from the second iteration"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Done))
+            .count(),
+        1,
+        "exactly one Done, after the continuation"
+    );
+}
+
+/// If the continuation is truncated again (e.g. the model is looping on the
+/// same sentence), the turn ends with an error instead of a silent Done.
+#[tokio::test]
+async fn test_repeatedly_truncated_final_answer_errors() {
+    let provider: StdArc<dyn LlmProvider> = StdArc::new(TestProvider::new(vec![
+        vec![
+            ChatEvent::TextDelta("Let me look at it. Let me look at it.".into()),
+            ChatEvent::OutputMetadata(length_metadata()),
+            ChatEvent::Done,
+        ],
+        vec![
+            ChatEvent::TextDelta("Let me look at it. Let me look at it.".into()),
+            ChatEvent::OutputMetadata(length_metadata()),
+            ChatEvent::Done,
+        ],
+    ]));
+
+    let (events, _sm, _sid) =
+        run_collect(provider, vec![], test_setup(), 10, 200, Message::user("Hi")).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { code: AgentErrorCode::LlmApi, message } if message.contains("max_tokens")
+        )),
+        "expected a max_tokens truncation error"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Done)),
+        "a truncated answer must not be reported as Done"
+    );
+}
+
 /// Thinking-only response with finish_reason="stop" should also continue
 /// the loop. Some providers (e.g. DeepSeek via OpenAI protocol) return
 /// "stop" after exhausting the thinking budget without generating text.
