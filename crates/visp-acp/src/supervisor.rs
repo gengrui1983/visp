@@ -135,6 +135,15 @@ pub async fn spawn_daemon(
     log_path: &Path,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<Child> {
+    // 全新环境下日志目录(默认 ~/.visp/logs)可能尚不存在;launcher 会先建目录,
+    // visp-acp 自拉起路径此前没有,导致首次运行即失败。
+    if let Some(parent) = log_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| anyhow!("failed to create log directory {}: {e}", parent.display()))?;
+    }
     let log_file = tokio::fs::File::create(log_path)
         .await
         .map_err(|e| anyhow!("failed to create log file {}: {e}", log_path.display()))?;
@@ -424,6 +433,32 @@ mod tests {
             "env 未注入或输出未重定向, log: {log}"
         );
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_creates_missing_log_dir() {
+        // 全新机器上 ~/.visp/logs 尚不存在:visp-acp 自拉起 daemon 时不能因此失败
+        let root = std::env::temp_dir().join(format!("visp-acp-sup-mkdir-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let log_path = root.join("nested").join("logs").join("daemon-test.log");
+
+        let mut child = spawn_daemon(
+            Path::new("/bin/bash"),
+            &["-c".into(), "echo started".into()],
+            "127.0.0.1:59935",
+            &log_path,
+            None,
+        )
+        .await
+        .expect("spawn_daemon should create the missing log directory");
+        child.wait().await.unwrap();
+
+        let log = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert!(
+            log.contains("started"),
+            "输出未重定向到新建目录下的日志, log: {log}"
+        );
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
