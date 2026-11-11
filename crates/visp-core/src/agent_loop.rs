@@ -40,8 +40,13 @@ const MAX_CONSECUTIVE_THINKING_ONLY: u32 = 3;
 const MAX_TRUNCATED_CONTINUATIONS: u32 = 1;
 
 /// 续写时插入的提示（与 doom-loop 提示同样以 system 消息进入历史）。
+///
+/// 两种截断都会走到这里：正文写到一半；或工具调用参数写到一半（openai.rs 会丢弃
+/// 不完整的调用并补一句 "[tool call truncated ...]"）。后者最常见于一次写入大文件。
 const TRUNCATION_CONTINUE_NOTICE: &str = "Your previous reply was cut off by the max_tokens limit. \
-Continue exactly where it stopped without repeating earlier text, and keep the rest concise.";
+If you were making a tool call, it was dropped and nothing was executed: issue it again, \
+splitting large content into smaller steps (for example, write a big file in several parts). \
+Otherwise continue exactly where the text stopped without repeating it, and keep the rest concise.";
 
 use crate::rules::RuleEngine;
 use crate::session::SessionManager;
