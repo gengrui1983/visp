@@ -13,7 +13,8 @@ use tonic::transport::Channel;
 use visp_proto::visp::client_message;
 use visp_proto::visp::coder_daemon_client::CoderDaemonClient;
 use visp_proto::visp::{
-    Ack, Cancel, ClientMessage, CreateSessionRequest, ServerMessage, UserInput, UserResponse,
+    Ack, Cancel, ClientMessage, CreateSessionRequest, LlmConfig, ServerMessage, UserInput,
+    UserResponse,
 };
 
 /// 进程内 Chat 流占用标记(与 daemon 的 V1 单流约束对齐)。
@@ -188,11 +189,21 @@ impl GrpcSession {
         client: &CoderDaemonClient<Channel>,
         project_path: &str,
     ) -> anyhow::Result<String> {
+        Self::create_session_with_config(client, project_path, None).await
+    }
+
+    /// 同上,并在创建时带初始 LLM 配置(ACP v1 没有模型选择请求;
+    /// `visp-tui run --model ...` 以启动参数传给 visp-acp,在这里落到会话)。
+    pub async fn create_session_with_config(
+        client: &CoderDaemonClient<Channel>,
+        project_path: &str,
+        config: Option<LlmConfig>,
+    ) -> anyhow::Result<String> {
         let mut client = client.clone();
         let resp = client
             .create_session(CreateSessionRequest {
                 project_path: project_path.into(),
-                config: None,
+                config,
             })
             .await
             .map_err(|e| anyhow!("create session: {e}"))?;

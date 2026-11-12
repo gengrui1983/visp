@@ -5352,6 +5352,7 @@ version = "0.5.5"
 dependencies = [
  "chrono",
  "clap",
+ "libc",
  "serde",
  "tempfile",
  "tokio",
@@ -5662,6 +5663,7 @@ dependencies = [
 name = "visp-tui"
 version = "0.5.5"
 dependencies = [
+ "agent-client-protocol",
  "chrono",
  "clap",
  "crossterm 0.28.1",
@@ -5676,6 +5678,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde_json",
  "syntect",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic 0.13.1",

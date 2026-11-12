@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent-client-protocol = "2.2"
 visp-proto = { path = "../visp-proto" }
 visp-command = { path = "../visp-command" }
 visp-config = { path = "../visp-config" }
@@ -31,3 +32,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

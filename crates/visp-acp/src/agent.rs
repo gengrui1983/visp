@@ -22,6 +22,7 @@ use agent_client_protocol::{
 use anyhow::anyhow;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
+use visp_proto::visp::LlmConfig;
 use visp_proto::visp::ServerMessage;
 use visp_proto::visp::coder_daemon_client::CoderDaemonClient;
 
@@ -51,6 +52,8 @@ pub struct AgentState {
     /// client 是否支持 `elicitation.form`(initialize 时记录,§7.5)
     supports_elicitation_form: AtomicBool,
     request_seq: AtomicU64,
+    /// 新会话的初始 LLM 配置(来自启动参数;ACP v1 无模型选择请求)。
+    llm_config: Option<LlmConfig>,
 }
 
 impl AgentState {
@@ -69,7 +72,15 @@ impl AgentState {
             cancel_fallback: CANCEL_FALLBACK,
             supports_elicitation_form: AtomicBool::new(false),
             request_seq: AtomicU64::new(1),
+            llm_config: None,
         }
+    }
+
+    /// 指定新会话的初始 LLM 配置(启动参数;非 ACP 协议消息)。
+    #[must_use]
+    pub fn with_llm_config(mut self, config: Option<LlmConfig>) -> Self {
+        self.llm_config = config;
+        self
     }
 
     /// 覆盖 cancel 兜底窗口(仅测试用;生产保持 `CANCEL_FALLBACK`)。
@@ -110,7 +121,8 @@ impl AgentState {
 
     async fn create_visp_session(&self, project_path: &str) -> anyhow::Result<String> {
         let client = self.client.lock().await;
-        GrpcSession::create_session(&client, project_path).await
+        GrpcSession::create_session_with_config(&client, project_path, self.llm_config.clone())
+            .await
     }
 
     async fn handle_cancel(&self, notif: &CancelNotification) {

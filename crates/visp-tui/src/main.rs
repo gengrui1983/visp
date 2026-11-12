@@ -5,12 +5,13 @@ mod connection;
 mod event;
 mod image;
 mod notify;
+mod run_mode;
 mod selection;
 mod theme;
 mod tool_ui;
 mod ui;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use client::VispClient;
 use crossterm::tty::IsTty;
 use visp_proto::visp::LlmConfig as ProtoLlmConfig;
@@ -38,11 +39,28 @@ struct Cli {
 
     #[arg(long)]
     list: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run one prompt non-interactively and exit (for scripts / CI).
+    ///
+    /// Acts as an ACP client: spawns `visp-acp`, which in turn starts the
+    /// daemon. The answer is printed on stdout, progress on stderr.
+    Run(run_mode::RunArgs),
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Non-interactive mode: no TUI, no direct daemon connection.
+    if let Some(Command::Run(args)) = cli.command {
+        std::process::exit(run_mode::run(args).await);
+    }
 
     // ── 加载配置（通知等可选功能；失败不阻断启动）──────────────────
     let config = match visp_config::load_config(None) {

@@ -7,7 +7,6 @@ use visp_proto::visp::ShutdownRequest;
 use visp_proto::visp::coder_daemon_client::CoderDaemonClient;
 
 mod hook_cmd;
-mod run_cmd;
 
 /// visp launcher — starts daemon + CLI in one command
 #[derive(Parser)]
@@ -52,18 +51,6 @@ enum LauncherCommand {
         #[command(subcommand)]
         action: HooksAction,
     },
-    /// Run one prompt non-interactively and exit (for scripts / CI).
-    ///
-    /// The answer is printed on stdout, progress on stderr. The prompt is
-    /// taken from the arguments, or from stdin when none (or "-") is given.
-    /// Exit code: 0 done, 1 agent error, 3 daemon stream lost, 130 interrupted.
-    Run {
-        /// Approve every tool request once (without it, all are denied).
-        #[arg(short = 'y', long)]
-        yes: bool,
-        /// The prompt (or "-" / nothing to read it from stdin).
-        prompt: Vec<String>,
-    },
 }
 
 /// `visp hooks` actions (design §15 / D10 / D11).
@@ -82,8 +69,96 @@ enum HooksAction {
     Logs,
 }
 
+/// Location of the `visp-tui` binary: test hook, then a sibling binary, then
+/// `PATH`.
+fn tui_bin() -> PathBuf {
+    if let Some(path) = std::env::var_os("VISP_TUI_BIN") {
+        return PathBuf::from(path);
+    }
+    resolve_bin("visp-tui")
+}
+
+/// Build `visp-tui run <args...>`, inheriting stdio.
+fn tui_run_command(bin: &Path, args: &[std::ffi::OsString]) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    command.arg("run").args(args);
+    command
+}
+
+/// Ctrl-C is delivered by the terminal to every process in the foreground
+/// process group, so `visp-tui` already gets SIGINT and shuts itself down. The
+/// launcher must not die on that same signal: it only waits, and its job is to
+/// report the child's exit code once the child is really gone (otherwise the
+/// shell prompt returns while `visp-tui` is still cancelling/cleaning up).
+///
+/// A real no-op handler is installed instead of `SIG_IGN`: ignored
+/// dispositions are inherited across `exec`, which would make `visp-tui`
+/// unable to see Ctrl-C at all. Custom handlers are reset to the default on
+/// `exec`, so the child is unaffected.
+#[cfg(unix)]
+fn defer_sigint_to_child() {
+    // SAFETY: the handler is an `extern "C"` function that does nothing and
+    // touches no shared state; `sigaction` is called on a fully initialised
+    // struct with an empty mask.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_sigint_without_exiting as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sigint_without_exiting(_sig: libc::c_int) {}
+
+#[cfg(not(unix))]
+fn defer_sigint_to_child() {}
+
+/// Run `visp-tui run ...` and return its exit code. The launcher does not
+/// inspect or rewrite the arguments.
+fn run_tui_passthrough(args: &[std::ffi::OsString]) -> i32 {
+    let bin = tui_bin();
+    // Before spawning, so the child never inherits a terminating disposition.
+    defer_sigint_to_child();
+    match tui_run_command(&bin, args).status() {
+        Ok(status) => exit_code(status),
+        Err(err) => {
+            eprintln!("[visp] Failed to start visp-tui ({}): {err}", bin.display());
+            eprintln!("[visp] Make sure 'visp-tui' is installed or set VISP_TUI_BIN.");
+            1
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+#[cfg(not(unix))]
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
 #[tokio::main]
 async fn main() {
+    // `visp run ...` is a pure process starter: hand every argument to
+    // `visp-tui run ...` unchanged and pass its exit code through. There is no
+    // daemon/gRPC/business logic in the launcher for this subcommand.
+    let mut argv = std::env::args_os();
+    let _program = argv.next();
+    let rest: Vec<std::ffi::OsString> = argv.collect();
+    if rest
+        .first()
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("run"))
+    {
+        std::process::exit(run_tui_passthrough(&rest[1..]));
+    }
+
     let cli = Cli::parse();
 
     // If --config-dir is given, export it as VISP_CONFIG_DIR so that the
@@ -91,12 +166,6 @@ async fn main() {
     if let Some(ref dir) = cli.config_dir {
         // SAFETY: single-threaded setup before any threads are spawned.
         unsafe { std::env::set_var("VISP_CONFIG_DIR", dir) };
-    }
-
-    // `visp run ...`: one prompt, no TUI.
-    if let Some(LauncherCommand::Run { yes, prompt }) = &cli.command {
-        let code = run_once(&cli, *yes, prompt).await;
-        std::process::exit(code);
     }
 
     // `visp hooks ...`: inspect hooks without launching the daemon/TUI.
@@ -259,137 +328,12 @@ async fn start_daemon(cli: &Cli) -> Option<(Child, String)> {
     Some((daemon, addr))
 }
 
-/// `visp run`: start the daemon, run one prompt, shut the daemon down.
-async fn run_once(cli: &Cli, approve: bool, words: &[String]) -> i32 {
-    use visp_proto::visp::{CreateSessionRequest, LlmConfig};
-
-    if cli.session.is_some() {
-        eprintln!("[visp run] --session is not supported yet; each run starts a new session");
-        return 2;
-    }
-    let prompt = match run_cmd::resolve_prompt(words, std::io::stdin()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[visp run] {e}");
-            return 2;
-        }
-    };
-
-    let Some((mut daemon, addr)) = start_daemon(cli).await else {
-        return 1;
-    };
-
-    let outcome =
-        async {
-            let mut client = CoderDaemonClient::connect(format!("http://{addr}"))
-                .await
-                .map_err(|e| format!("connect daemon: {e}"))?;
-
-            // Same session config as the TUI's new-session path.
-            let mut extra = std::collections::HashMap::new();
-            if let Some(budget) = cli.thinking_budget {
-                extra.insert("thinking_budget_tokens".into(), budget.to_string());
-            }
-            let config = (cli.model.is_some() || cli.temperature.is_some() || !extra.is_empty())
-                .then(|| LlmConfig {
-                    model: cli.model.clone(),
-                    model_key: None,
-                    temperature: cli.temperature,
-                    max_tokens: None,
-                    max_context_tokens: None,
-                    extra,
-                });
-            let project = PathBuf::from(&cli.project);
-            let project = project.canonicalize().unwrap_or(project);
-            let session_id = client
-                .create_session(CreateSessionRequest {
-                    project_path: project.to_string_lossy().to_string(),
-                    config,
-                })
-                .await
-                .map_err(|e| format!("create session: {e}"))?
-                .into_inner()
-                .session_id;
-
-            let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
-            let mut stream = client
-                .chat(tokio_stream::wrappers::ReceiverStream::new(out_rx))
-                .await
-                .map_err(|e| format!("chat stream: {e}"))?
-                .into_inner();
-            let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(256);
-            tokio::spawn(async move {
-                while let Ok(Some(m)) = stream.message().await {
-                    if in_tx.send(m).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            out_tx
-                .send(run_cmd::user_input(&session_id, &prompt))
-                .await
-                .map_err(|_| "chat stream closed before the prompt was sent".to_string())?;
-
-            let mut stats = run_cmd::RunStats::default();
-            let started = std::time::Instant::now();
-            let outcome = run_cmd::drive(
-                &mut in_rx,
-                &out_tx,
-                &session_id,
-                approve,
-                &mut std::io::stdout(),
-                &mut std::io::stderr(),
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
-                &mut stats,
-            )
-            .await;
-            eprintln!(
-                "[visp run] {:?} in {:.0}s: {} tool calls, approvals {} granted / {} denied, \
-             main agent last call: tokens in {} / out {}",
-                outcome,
-                started.elapsed().as_secs_f64(),
-                stats.tool_calls,
-                stats.approvals_granted,
-                stats.approvals_denied,
-                stats.last_input_tokens,
-                stats.last_output_tokens
-            );
-            Ok::<_, String>(outcome)
-        }
-        .await;
-
-    let code = match outcome {
-        Ok(o) => {
-            if let run_cmd::RunOutcome::AgentError { code, message } = &o {
-                eprintln!("[visp run] agent error {code}: {message}");
-            }
-            o.exit_code()
-        }
-        Err(e) => {
-            eprintln!("[visp run] {e}");
-            1
-        }
-    };
-    let _ = shutdown_and_wait(
-        &mut daemon,
-        std::time::Duration::from_secs(5),
-        send_shutdown(&addr),
-    )
-    .await;
-    code
-}
-
 /// Dispatch launcher subcommands; returns the process exit code.
 async fn run_subcommand(command: &LauncherCommand, cli: &Cli) -> i32 {
     match command {
         LauncherCommand::Hooks { action } => {
             hook_cmd::run(action, Path::new(&cli.project), &cli.addr, cli.dry_run).await
         }
-        // Handled in main() before this dispatcher (it needs the daemon).
-        LauncherCommand::Run { .. } => unreachable!("visp run is dispatched in main"),
     }
 }
 
@@ -725,5 +669,37 @@ mod tests {
     fn no_subcommand_defaults_to_none() {
         let cli = Cli::try_parse_from(["visp"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn run_passthrough_builds_visp_tui_run_with_verbatim_args() {
+        use std::ffi::OsString;
+        let args: Vec<OsString> = ["-y", "--config-dir", "/cfg", "hello", "world"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let command = tui_run_command(Path::new("/bin/visp-tui"), &args);
+        assert_eq!(command.get_program(), Path::new("/bin/visp-tui"));
+        let forwarded: Vec<OsString> = command.get_args().map(|a| a.to_os_string()).collect();
+        assert_eq!(
+            forwarded,
+            [
+                OsString::from("run"),
+                OsString::from("-y"),
+                OsString::from("--config-dir"),
+                OsString::from("/cfg"),
+                OsString::from("hello"),
+                OsString::from("world"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_passes_through_and_signal_status_maps_to_128_plus_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code(std::process::ExitStatus::from_raw(7 << 8)), 7);
+        assert_eq!(exit_code(std::process::ExitStatus::from_raw(130 << 8)), 130);
+        assert_eq!(exit_code(std::process::ExitStatus::from_raw(9)), 137);
     }
 }

@@ -40,6 +40,19 @@ pub struct Cli {
     /// 直连模式下退出时也向 daemon 发送 Shutdown(默认直连不关 daemon)
     #[arg(long)]
     pub shutdown_on_exit: bool,
+
+    /// 新会话的 LLM 模型(API model key)。ACP v1 没有模型选择请求,
+    /// 客户端(`visp-tui run --model`)以此启动参数传给 visp-acp。
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// 新会话的 LLM temperature。
+    #[arg(long)]
+    pub temperature: Option<f64>,
+
+    /// 新会话的 thinking budget(写入 llm.extra.thinking_budget_tokens)。
+    #[arg(long)]
+    pub thinking_budget: Option<u32>,
 }
 
 impl Cli {
@@ -47,6 +60,24 @@ impl Cli {
     pub fn base_addr(&self) -> SocketAddr {
         self.addr
             .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.parse().expect("valid default addr"))
+    }
+
+    /// 启动参数映射出的初始会话配置(全部未指定时返回 `None`,沿用 daemon 默认)。
+    pub fn llm_config(&self) -> Option<visp_proto::visp::LlmConfig> {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(budget) = self.thinking_budget {
+            extra.insert("thinking_budget_tokens".to_string(), budget.to_string());
+        }
+        (self.model.is_some() || self.temperature.is_some() || !extra.is_empty()).then(|| {
+            visp_proto::visp::LlmConfig {
+                model: self.model.clone(),
+                model_key: None,
+                temperature: self.temperature,
+                max_tokens: None,
+                max_context_tokens: None,
+                extra,
+            }
+        })
     }
 }
 
@@ -96,7 +127,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         r = async {
             let session = crate::grpc::GrpcSession::connect(&addr).await?;
             let (outbound, inbound, client) = session.into_parts();
-            let state = Arc::new(agent::AgentState::new(outbound, inbound, client));
+            let state = Arc::new(
+                agent::AgentState::new(outbound, inbound, client)
+                    .with_llm_config(cli.llm_config()),
+            );
             agent::run_agent(Stdio::new(), state).await
         } => r,
         signal = supervisor::termination_signal() => {
@@ -181,5 +215,34 @@ mod tests {
     fn shutdown_on_exit_defaults_to_false() {
         let cli = parse(["visp-acp"]);
         assert!(!cli.shutdown_on_exit);
+    }
+
+    #[test]
+    fn llm_config_is_none_without_overrides() {
+        assert!(parse(["visp-acp"]).llm_config().is_none());
+    }
+
+    #[test]
+    fn llm_config_carries_launch_overrides() {
+        let cli = parse([
+            "visp-acp",
+            "--model",
+            "provider/model",
+            "--temperature",
+            "0.2",
+            "--thinking-budget",
+            "2048",
+        ]);
+        let config = cli.llm_config().expect("overrides must produce a config");
+        assert_eq!(config.model.as_deref(), Some("provider/model"));
+        assert_eq!(config.model_key, None);
+        assert_eq!(config.temperature, Some(0.2));
+        assert_eq!(
+            config
+                .extra
+                .get("thinking_budget_tokens")
+                .map(String::as_str),
+            Some("2048")
+        );
     }
 }
