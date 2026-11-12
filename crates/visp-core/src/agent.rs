@@ -422,6 +422,8 @@ pub struct AgentConfig {
     pub llm_retry_attempts: u32,
     /// LLM 重试基础延迟（毫秒）
     pub llm_retry_base_delay_ms: u64,
+    /// 服务端返回上下文超长错误后，压缩并重试的最大次数（0 = 不自救）
+    pub context_overflow_retries: u32,
     /// bash 工具确认模式（执行高危命令前是否需要用户确认）
     pub bash_confirm_mode: bool,
     /// 文件读取/写入的最大字节数
@@ -464,6 +466,7 @@ impl Default for AgentConfig {
             doom_loop_threshold: 5,
             llm_retry_attempts: 3,
             llm_retry_base_delay_ms: 1000,
+            context_overflow_retries: 2,
             bash_confirm_mode: true,
             file_max_size_bytes: 1048576,
             max_depth: 5,

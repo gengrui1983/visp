@@ -100,6 +100,33 @@ max_context_tokens = 128000
 # file_max_size_bytes = 1048576
 
 # ---------------------------------------------------------------------------
+# 上下文管理（自适应估算 + 压缩 + 持久任务记忆）
+# ---------------------------------------------------------------------------
+[agent.context]
+# 关闭后退回不裁剪行为（仅用于调试）
+# enabled = true
+# 持久任务记忆 + memory 工具
+# memory_enabled = true
+# 保护的开头轮数（任务目标）与末尾轮数（最近工作流）
+# head_turns = 2
+# tail_turns = 6
+# 达到预算百分比触发压缩；压缩到 target，形成滞后区间
+# compact_trigger_pct = 80
+# compact_target_pct = 45
+# 额外 token 安全边际（百分比）
+# safety_margin_pct = 12
+# 单条工具输出保留的最大字符数（首尾保留）
+# tool_output_max_chars = 8000
+# 输出 token 最小预留
+# min_output_tokens = 2000
+# 压缩摘要最大 token
+# max_summary_tokens = 1200
+# 注入摘要/检索的最大记忆条数
+# max_memory_entries = 80
+# 服务端上下文超长后的自救重试次数
+# overflow_retries = 2
+
+# ---------------------------------------------------------------------------
 # 内置 Agent 覆盖配置
 # ---------------------------------------------------------------------------
 # visp 内置了 default、explorer、fixer 三个 agent。

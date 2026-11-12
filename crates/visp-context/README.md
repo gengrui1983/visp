@@ -1,82 +1,105 @@
-# visp-context — 上下文裁剪器
+# visp-context — 自适应上下文管理
 
 ## 职责
 
-管理 LLM 对话历史的 context window，防止超出 token 限制。
+在有限上下文窗口内保留“继续工作所需的信息”，而不是简单丢弃历史。
+完整设计见 `docs/design/2026-11-12-context-management.md`。
 
 ## 核心能力
 
-### Token 预算计算
+### 1. 更准的 token 估算
 
-根据 `max_context_tokens` 和 `output_tokens` 计算本轮对话历史的可用 token 预算：
+- 按字符类别估算：ASCII 字母/数字 4 字符/token，ASCII 标点 2 字符/token，
+  CJK/emoji 1 字符/token，换行单独计数。
+- 每条消息 +3 协议开销；每个 tool call +4 结构开销；每张图片 +1024 预留。
+- 工具定义（name/description/schema）计入 system overhead。
+- 用 provider 上报的 `UsageInfo.input_tokens` 做**会话级校准**：
+  `calibration = max(previous, actual/estimated)`，只向上、限幅 [1.0, 6.0]。
+  不依赖模型名称。
 
-```
-available = max_context_tokens − max(output_tokens, 4000)
-history_budget = available − system_overhead
-```
-
-### 三段式裁剪策略
-
-```
-HEAD (5 turns) | MIDDLE (可裁剪) | TAIL (10 turns)
-```
-
-- **HEAD**：对话开头的轮次，保护不裁剪（保留任务目标、上下文建立过程）
-- **TAIL**：对话末尾的轮次，保护不裁剪（保留最近的对话流）
-- **MIDDLE**：可裁剪区域，从最旧轮次开始按完整轮次删除直到满足预算
-
-### 极端保底
-
-当 HEAD + TAIL 本身已超出预算时：
-- 保留第一条 User 消息（任务锚点）
-- 从尾部往前填充最近消息
-- 过滤孤立的 ToolResult（对应 tool_use 已被裁剪）
-- 插入 `[... earlier messages omitted ...]` 标记
-
-### 工具输出压缩
-
-Tool 消息输出超过 2000 字符时自动截断，附加 `[truncated N chars]` 标记。仅影响发给 LLM 的 prompt 副本，存储中的原始内容完整保留。
-
-## 架构
+### 2. 预算与滞后区间
 
 ```
-visp-core (ContextTrimmer trait)
-    ↑
-visp-context (DefaultContextTrimmer — 实现 trait)
-    ↑
-visp-daemon (创建实例，注入 Agent 循环)
+output_reserve = max(max_tokens, min_output_tokens)（≤ 窗口 75%）
+available = max_context_tokens − output_reserve − system/tool overhead
+budget = available × (1 − safety_margin) / calibration
+trigger = budget × compact_trigger_pct   // 默认 80%
+target  = budget × compact_target_pct    // 默认 45%
 ```
 
-`ContextTrimmer` trait 定义在 `visp-core` 中，`visp-context` 实现默认策略。Daemon 通过 `Arc<dyn ContextTrimmer>` 依赖注入，core 不依赖具体实现。未来可替换为其他裁剪策略（如 LLM 摘要压缩）。
+达到 trigger 才压缩；压缩到 target，避免每轮抖动。
+
+### 3. 结构化压缩（非丢弃）
+
+```
+HEAD（默认 2 轮） | 压缩摘要（system） | TAIL（默认 6 轮）
+```
+
+摘要保留：
+
+- Goal（首条用户消息）
+- Next step（最后一条 assistant 文本）
+- Decisions / Direction changes / Dead ends / Confirmed facts
+- Work already done：去重的工具调用日志（`grep(...) (x3) -> error: ...`），
+  直接抑制重复调用
+- 已持久化的任务记忆
+
+同时：
+
+- 工具输出超过配置字符数时保留前 60% + 后 40%，日志尾部错误不丢。
+- 仍超预算时逐级减少 TAIL/HEAD、硬截断，最终保留 goal + summary + last user。
+- 输出前修复孤立的 tool call/result，避免 provider 400。
+
+### 4. 持久任务记忆
+
+- `MemoryKind`：goal / fact / decision / dead_end / pivot / work / next
+- 压缩时自动抽取并写入 `MemoryStore`（SQLite 表 `context_memory`，与会话库
+  同文件、级联删除、幂等）。
+- `memory` 工具支持 `record` / `search` / `list`，agent 压缩后仍可查回。
+- 无存储/写入失败时降级为内存，不阻塞对话。
+
+### 5. 服务端超长自救
+
+`LlmError::is_context_length_exceeded` 识别 400/413/422 的中英文超长文案。
+agent loop 会提高压缩压力、强制压缩、重建 prompt 并重试（默认 2 次），
+而不是让会话直接失败。
 
 ## 使用
 
 ```rust
-use visp_context::DefaultContextTrimmer;
-use visp_core::context::ContextTrimmer;
+use std::sync::Arc;
+use visp_context::{ContextConfig, DefaultContextTrimmer};
 
-// 默认配置：head=5, tail=10, tool_output_max_chars=2000
-let trimmer = DefaultContextTrimmer::default();
-
-// 裁剪对话历史
-let trimmed = trimmer.trim(
-    &history,           // 对话历史（不含 system message）
-    max_context_tokens,  // LLM 上下文窗口大小
-    system_overhead,     // system prompt 等开销
-    output_tokens,       // 期望输出 token 数
+let trimmer = DefaultContextTrimmer::new(
+    ContextConfig::default(),
+    Some(memory_store), // Arc<dyn visp_core::memory::MemoryStore>
 );
+
+// 由 PromptBuilder / agent loop 调用
+let trimmed = trimmer.trim_for_session(
+    Some(&session_id),
+    &history,
+    max_context_tokens,
+    system_overhead, // 含工具定义
+    output_tokens,
+);
+
+// provider 返回 usage 后校准
+trimmer.observe_usage(Some(&session_id), estimated_input, actual_input);
+// 服务端报上下文超长后
+trimmer.on_context_overflow(Some(&session_id));
 ```
 
 ## 配置
 
-裁剪参数当前为内部常量，不对外暴露配置：
+`daemon.toml` 的 `[agent.context]` 全部可配置且有默认值，详见设计文档 §8。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `head_turns` | 5 | 保护的对话开头轮数 |
-| `tail_turns` | 10 | 保护的对话末尾轮数 |
-| `tool_output_max_chars` | 2000 | Tool 输出截断阈值 |
+## 架构
 
-## Token 估算
-
-基于 `chars/4` 的简单估算（1 token ≈ 4 字符），消息构造时预计算存入 `Message.estimated_tokens` 字段。裁剪决策使用预计算值，Tool 消息按截断后长度调整。
+```
+visp-core (ContextTrimmer trait / MemoryStore trait / token estimator)
+    ↑
+visp-context (DefaultContextTrimmer / compaction / calibration)
+    ↑
+visp-daemon (注入 SQLite memory store、注册 memory 工具)
+```

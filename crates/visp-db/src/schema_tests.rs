@@ -12,13 +12,13 @@ fn test_migrate_creates_tables() {
 
     // Verify session table exists
     let tables: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session', 'message') ORDER BY name")
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session', 'message', 'context_memory') ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(tables, vec!["message", "session"]);
+    assert_eq!(tables, vec!["context_memory", "message", "session"]);
 }
 
 #[test]
@@ -35,6 +35,7 @@ fn test_migrate_creates_indexes() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let expected: Vec<&str> = vec![
+        "idx_context_memory_session",
         "idx_message_session",
         "idx_message_session_role",
         "idx_message_tool_call",
@@ -58,7 +59,7 @@ fn test_migrate_idempotent() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
 }
 
 #[test]
@@ -93,7 +94,7 @@ fn test_migrate_version() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -156,7 +157,7 @@ fn test_migrate_v1_to_v2() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     // Verify tool_calls_json column exists
     let has_column: bool = conn
@@ -256,7 +257,7 @@ fn test_migrate_v2_to_v3() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     // Verify skip_context column exists
     let has_column: bool = conn
@@ -302,7 +303,7 @@ fn test_migrate_v3_to_v4() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     // Verify new columns exist
     for col in &["agent_name", "parent_id", "permission_json"] {

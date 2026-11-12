@@ -153,6 +153,21 @@ struct IterationContext {
     tools: Vec<ToolDefinition>,
 }
 
+/// 估算工具定义在 prompt 中占用的 token。
+///
+/// 工具 schema（名称、描述、JSON Schema）通常有数千 token，之前完全没计入
+/// 预算，是长会话溢出的一处隐性来源。
+fn estimate_tool_definitions_tokens(tools: &[ToolDefinition]) -> u32 {
+    tools
+        .iter()
+        .map(|t| {
+            estimate_message_tokens(&Message::user(&t.name))
+                .saturating_add(crate::message::estimate_tokens(&t.description))
+                .saturating_add(crate::message::estimate_tokens(&t.parameters.to_string()))
+        })
+        .sum()
+}
+
 /// a. Cancellation check  b. Limits check  c. Prompt + tools build
 #[allow(clippy::too_many_arguments)]
 async fn setup_iteration(
@@ -254,7 +269,11 @@ async fn setup_iteration(
          If all work is done, respond without making any tool calls.]",
         );
     }
-    let mut messages = PromptBuilder::build(
+    let tools = tool_registry.definitions();
+    let tool_tokens = estimate_tool_definitions_tokens(&tools);
+
+    let mut messages = PromptBuilder::build_for_session(
+        Some(ctx.session_id.as_str()),
         &enriched_template,
         &rule_engine.get_active_rules(),
         &ctx.history,
@@ -262,23 +281,23 @@ async fn setup_iteration(
         &date_str,
         Some(ctx.config.max_context_tokens),
         ctx.config.max_tokens,
+        tool_tokens,
         ctx.context_trimmer.as_ref(),
     );
 
     cleanup_orphan_tool_uses(&mut messages);
     messages.retain(|m| !m.skip_context);
 
-    let tools = tool_registry.definitions();
-
-    let total_estimated: u32 = messages
-        .iter()
-        .map(crate::message::estimate_message_tokens)
-        .sum();
+    let total_estimated = ctx
+        .context_trimmer
+        .estimate_tokens(Some(ctx.session_id.as_str()), &messages)
+        .saturating_add(tool_tokens);
     tracing::info!(
         session_id = %sid,
         messages = messages.len(),
         budget = ctx.config.max_context_tokens,
         estimated_tokens = total_estimated,
+        tool_tokens,
         max_output_tokens = ctx.config.max_tokens,
         "prompt built, calling LLM"
     );
@@ -1728,35 +1747,52 @@ pub async fn run_agent_loop(
             );
 
             // a/b/c: Build prompt + boundary checks
-            let ic = match setup_iteration(
-                iteration,
-                &mut ctx,
-                &sm,
-                &tool_registry,
-                &rule_engine,
-                &cfg,
-                &sid,
-                &tx,
-            )
-            .instrument(iteration_span.clone())
-            .await
-            {
-                Ok(ic) => ic,
-                Err(()) => {
-                    // setup_iteration sends cancellaton / iteration_limit events internally
-                    return;
-                }
-            };
-            let messages = ic.messages;
-            let tools = ic.tools;
-
-            // d. Call LLM with retry
-            let stream =
-                match call_llm_with_retry(provider.as_ref(), &messages, &tools, &ctx, &cfg, &sid)
-                    .instrument(iteration_span.clone())
-                    .await
+            // d. Call LLM with retry.
+            //
+            // 服务端上下文超长时，不能直接把整个会话判死：提高压缩压力、
+            // 重新构建 prompt，再重试同一次调用（有上限）。
+            let mut overflow_retries: u32 = 0;
+            let (_messages, _tools, stream, prompt_estimated) = loop {
+                let ic = match setup_iteration(
+                    iteration,
+                    &mut ctx,
+                    &sm,
+                    &tool_registry,
+                    &rule_engine,
+                    &cfg,
+                    &sid,
+                    &tx,
+                )
+                .instrument(iteration_span.clone())
+                .await
                 {
-                    Ok(s) => s,
+                    Ok(ic) => ic,
+                    Err(()) => {
+                        // setup_iteration sends cancellaton / iteration_limit events internally
+                        return;
+                    }
+                };
+                let messages = ic.messages;
+                let tools = ic.tools;
+                // 校准必须基于未校准的基础估算，否则会形成反馈回路。
+                let prompt_estimated: u32 = messages
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum::<u32>()
+                    .saturating_add(estimate_tool_definitions_tokens(&tools));
+
+                match call_llm_with_retry(
+                    provider.as_ref(),
+                    &messages,
+                    &tools,
+                    &ctx,
+                    &cfg,
+                    &sid,
+                )
+                .instrument(iteration_span.clone())
+                .await
+                {
+                    Ok(s) => break (messages, tools, s, prompt_estimated),
                     Err(LlmError::Cancelled) => {
                         // retry 阶段被 cancel：还没拿到 stream，
                         // 必须在此显式发 Cancelled 事件 + finish_loop（collect_stream_events 不会被调用）
@@ -1781,6 +1817,42 @@ pub async fn run_agent_loop(
                         let _ = sm.finish_loop(&sid, SessionStatus::Error);
                         return;
                     }
+                    Err(e)
+                        if e.is_context_length_exceeded()
+                            && overflow_retries < cfg.context_overflow_retries =>
+                    {
+                        overflow_retries += 1;
+                        let level = ctx
+                            .context_trimmer
+                            .on_context_overflow(Some(ctx.session_id.as_str()));
+                        tracing::warn!(
+                            target: "visp.agent.context_overflow",
+                            session_id = %sid,
+                            iteration,
+                            attempt = overflow_retries,
+                            max_attempts = cfg.context_overflow_retries,
+                            pressure_level = level,
+                            error = %e,
+                            "LLM rejected prompt as too long; compacting and retrying"
+                        );
+                        let status = format!(
+                            "上下文超出模型窗口，已压缩历史并重试（{}/{}，级别 {}）",
+                            overflow_retries, cfg.context_overflow_retries, level
+                        );
+                        if send_event(
+                            &tx,
+                            &sm,
+                            &sid,
+                            &ctx.global_tx,
+                            &ctx.session_id,
+                            AgentEvent::StatusUpdate(status),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Err(e) => {
                         let (code, msg) = llm_error_to_code(&e);
                         let _ = send_event(
@@ -1795,7 +1867,8 @@ pub async fn run_agent_loop(
                         let _ = sm.finish_loop(&sid, SessionStatus::Error);
                         return;
                     }
-                };
+                }
+            };
 
             // e. Collect stream events
             let output = match collect_stream_events(stream, &mut ctx, &sid, &tx, &sm)
@@ -1812,6 +1885,23 @@ pub async fn run_agent_loop(
                     return;
                 }
             };
+
+            // 用 provider 上报的真实输入 token 校准本会话估算；
+            // 这能修正常见的分词器差异（CJK、代码、JSON）。
+            if output.input_tokens > 0 {
+                ctx.context_trimmer.observe_usage(
+                    Some(ctx.session_id.as_str()),
+                    prompt_estimated,
+                    output.input_tokens,
+                );
+                tracing::debug!(
+                    target: "visp.agent.token_calibration",
+                    session_id = %sid,
+                    estimated = prompt_estimated,
+                    actual = output.input_tokens,
+                    "observed provider input token usage"
+                );
+            }
 
             // f. Handle stream result (check USER_QUERY marker or done)
             match handle_stream_result(&output, total_tool_calls, &mut ctx, &sm, &sid, &tx)

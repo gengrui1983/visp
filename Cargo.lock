@@ -5460,6 +5460,8 @@ name = "visp-context"
 version = "0.5.5"
 dependencies = [
  "tempfile",
+ "tracing",
+ "visp-config",
  "visp-core",
 ]
 

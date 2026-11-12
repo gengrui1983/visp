@@ -187,31 +187,31 @@ fn test_actual_fields_backward_compat() {
 #[test]
 fn test_user_message_tokens() {
     let msg = Message::user("hello");
-    assert_eq!(msg.estimated_tokens, 3); // ceil(5/4)=2 + 1 role
+    assert_eq!(msg.estimated_tokens, 5); // ceil(5/4)=2 + 3 overhead
 }
 
 #[test]
 fn test_user_empty_message_tokens() {
     let msg = Message::user("");
-    assert_eq!(msg.estimated_tokens, 1); // 0 + 1 role
+    assert_eq!(msg.estimated_tokens, 3); // 0 + 3 overhead
 }
 
 #[test]
 fn test_tool_message_tokens() {
     let msg = Message::tool("output", "call_1");
-    assert_eq!(msg.estimated_tokens, 5); // ceil(6/4)=2 + 1 role + ceil(6/4)=2 = 5
+    assert_eq!(msg.estimated_tokens, 8); // output 2 + overhead 3 + call_id 3
 }
 
 #[test]
 fn test_assistant_message_tokens() {
     let msg = Message::assistant("hi");
-    assert_eq!(msg.estimated_tokens, 2); // ceil(2/4)=1 + 1 role
+    assert_eq!(msg.estimated_tokens, 4); // ceil(2/4)=1 + 3 overhead
 }
 
 #[test]
 fn test_system_message_tokens() {
     let msg = Message::system("prompt");
-    assert_eq!(msg.estimated_tokens, 3); // ceil(6/4)=2 + 1 role
+    assert_eq!(msg.estimated_tokens, 5); // ceil(6/4)=2 + 3 overhead
 }
 
 #[test]
@@ -227,6 +227,44 @@ fn test_estimate_tokens_empty() {
 #[test]
 fn test_estimate_tokens_longer() {
     assert_eq!(estimate_tokens("hello world"), 3); // ceil(11/4)=3
+}
+
+#[test]
+fn test_estimate_tokens_cjk_not_underestimated() {
+    // CJK 文本按 UTF-8 每字 3 字节；旧的 bytes/4 会低估约 25%。
+    // 新估算至少按 1 token/字，避免本地模型上下文溢出。
+    let text = "中".repeat(1000);
+    let estimate = estimate_tokens(&text);
+    assert!(
+        estimate >= 1000,
+        "CJK estimation must be >= one token per char, got {estimate}"
+    );
+}
+
+#[test]
+fn test_estimate_tokens_json_punctuation_is_conservative() {
+    // JSON / 代码标点 token 化很差，不能按 4 字符/token 估算。
+    let text = "{}[](),:;".repeat(100);
+    let estimate = estimate_tokens(&text);
+    assert!(
+        estimate >= 400,
+        "punctuation-heavy text must not be estimated at bytes/4, got {estimate}"
+    );
+}
+
+#[test]
+fn test_estimate_message_tokens_includes_image_cost() {
+    let mut msg = Message::user("look at this");
+    msg.images.push(ImageData {
+        path: "/tmp/a.png".into(),
+        base64: "x".repeat(10_000),
+        mime_type: "image/png".into(),
+    });
+    let estimate = estimate_message_tokens(&msg);
+    assert!(
+        estimate >= 1024,
+        "vision requests need a non-zero image reserve, got {estimate}"
+    );
 }
 
 #[test]

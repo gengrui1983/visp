@@ -44,6 +44,48 @@ pub enum LlmError {
     Cancelled,
 }
 
+impl LlmError {
+    /// 是否为「输入超过模型上下文窗口」类错误。
+    ///
+    /// 不同 provider 的文案差异很大（OpenAI/vLLM、Anthropic、各类网关、
+    /// 中文错误信息），因此基于状态码 + 关键词组合判断，而不是模型名称。
+    /// 仅 4xx（400/413/422）参与判断，避免把 5xx 或限流误判为上下文超长。
+    pub fn is_context_length_exceeded(&self) -> bool {
+        let LlmError::Api { status, message } = self else {
+            return false;
+        };
+        if !matches!(*status, 400 | 413 | 422) {
+            return false;
+        }
+
+        let message = message.to_lowercase();
+        const PHRASES: &[&str] = &[
+            "context length",
+            "context_length",
+            "context window",
+            "maximum context",
+            "max context",
+            "prompt is too long",
+            "input is too long",
+            "too many tokens",
+            "reduce the length",
+            "maximum number of tokens",
+            "exceeds the model",
+            "request entity too large",
+            "上下文长度",
+            "上下文超",
+            "超出最大",
+            "输入过长",
+        ];
+        if PHRASES.iter().any(|p| message.contains(p)) {
+            return true;
+        }
+
+        // 兜底：同时出现 token 与“超限”语义（不同网关措辞不统一）。
+        message.contains("token") && (message.contains("exceed") || message.contains("too long"))
+    }
+}
+
 /// 会话相关错误
 #[derive(Error, Debug)]
 pub enum SessionError {

@@ -537,6 +537,72 @@ pub struct AgentSection {
     /// 内置 agent 覆盖配置（model / temperature / steps）
     #[serde(default)]
     pub builtin: Vec<BuiltinAgentConfig>,
+    /// 上下文管理策略（压缩、token 估算安全边际、任务记忆）
+    #[serde(default)]
+    pub context: ContextSection,
+}
+
+/// 上下文管理配置。
+///
+/// 所有默认值都不依赖模型名称：32k 本地模型和 1M 云端模型使用同一套逻辑，
+/// 只通过 `max_context_tokens` / `max_tokens` 输入和 provider 上报的 usage 自适应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSection {
+    /// 是否启用上下文压缩（false 时退化为不裁剪）
+    #[serde(default = "default_context_enabled")]
+    pub enabled: bool,
+    /// 是否启用持久化任务记忆（压缩时写入、agent 可检索）
+    #[serde(default = "default_context_memory_enabled")]
+    pub memory_enabled: bool,
+    /// 保护的对话开头轮数（保留任务目标）
+    #[serde(default = "default_context_head_turns")]
+    pub head_turns: usize,
+    /// 保护的对话末尾轮数（保留最近工作流）
+    #[serde(default = "default_context_tail_turns")]
+    pub tail_turns: usize,
+    /// 达到预算的百分比时触发压缩
+    #[serde(default = "default_context_trigger_pct")]
+    pub compact_trigger_pct: u8,
+    /// 压缩后目标预算百分比（留出滞后区间，避免每轮都压缩）
+    #[serde(default = "default_context_target_pct")]
+    pub compact_target_pct: u8,
+    /// token 安全边际百分比（额外预留，避免估算误差导致 400）
+    #[serde(default = "default_context_safety_margin_pct")]
+    pub safety_margin_pct: u8,
+    /// 单条工具输出保留的最大字符数
+    #[serde(default = "default_context_tool_output_max_chars")]
+    pub tool_output_max_chars: usize,
+    /// 输出 token 的最小预留
+    #[serde(default = "default_context_min_output_tokens")]
+    pub min_output_tokens: u32,
+    /// 压缩摘要的最大 token 数
+    #[serde(default = "default_context_max_summary_tokens")]
+    pub max_summary_tokens: u32,
+    /// 拼入摘要/查询结果的最大记忆条数
+    #[serde(default = "default_context_max_memory_entries")]
+    pub max_memory_entries: usize,
+    /// 服务端上下文超长后最多自救重试次数
+    #[serde(default = "default_context_overflow_retries")]
+    pub overflow_retries: u32,
+}
+
+impl Default for ContextSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_context_enabled(),
+            memory_enabled: default_context_memory_enabled(),
+            head_turns: default_context_head_turns(),
+            tail_turns: default_context_tail_turns(),
+            compact_trigger_pct: default_context_trigger_pct(),
+            compact_target_pct: default_context_target_pct(),
+            safety_margin_pct: default_context_safety_margin_pct(),
+            tool_output_max_chars: default_context_tool_output_max_chars(),
+            min_output_tokens: default_context_min_output_tokens(),
+            max_summary_tokens: default_context_max_summary_tokens(),
+            max_memory_entries: default_context_max_memory_entries(),
+            overflow_retries: default_context_overflow_retries(),
+        }
+    }
 }
 
 /// 内置 agent 配置覆盖项，用于在 daemon.toml 中为内置 agent
@@ -795,6 +861,42 @@ fn default_soft_limit() -> u32 {
 fn default_doom_loop_threshold() -> u32 {
     5
 }
+fn default_context_enabled() -> bool {
+    true
+}
+fn default_context_memory_enabled() -> bool {
+    true
+}
+fn default_context_head_turns() -> usize {
+    2
+}
+fn default_context_tail_turns() -> usize {
+    6
+}
+fn default_context_trigger_pct() -> u8 {
+    80
+}
+fn default_context_target_pct() -> u8 {
+    45
+}
+fn default_context_safety_margin_pct() -> u8 {
+    12
+}
+fn default_context_tool_output_max_chars() -> usize {
+    8_000
+}
+fn default_context_min_output_tokens() -> u32 {
+    2_000
+}
+fn default_context_max_summary_tokens() -> u32 {
+    1_200
+}
+fn default_context_max_memory_entries() -> usize {
+    80
+}
+fn default_context_overflow_retries() -> u32 {
+    2
+}
 fn default_retry_attempts() -> u32 {
     3
 }
@@ -1038,6 +1140,7 @@ fn default_agent_section() -> AgentSection {
         max_depth: default_max_depth(),
         max_concurrent_subagents: default_max_concurrent_subagents(),
         builtin: Vec::new(),
+        context: ContextSection::default(),
     }
 }
 
@@ -4513,5 +4616,69 @@ mod tests_daemon_filewatcher {
         assert!(!config.daemon.filewatcher);
         assert_eq!(config.daemon.listen_addr, default_listen_addr());
         assert_eq!(config.daemon.log_level, default_log_level());
+    }
+}
+
+#[cfg(test)]
+mod tests_context_section {
+    use super::*;
+
+    #[test]
+    fn context_defaults_are_sane() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let c = &config.agent.context;
+        assert!(c.enabled);
+        assert!(c.memory_enabled);
+        assert_eq!(c.head_turns, 2);
+        assert_eq!(c.tail_turns, 6);
+        assert_eq!(c.compact_trigger_pct, 80);
+        assert_eq!(c.compact_target_pct, 45);
+        assert_eq!(c.safety_margin_pct, 12);
+        assert_eq!(c.tool_output_max_chars, 8_000);
+        assert_eq!(c.min_output_tokens, 2_000);
+        assert_eq!(c.max_summary_tokens, 1_200);
+        assert_eq!(c.max_memory_entries, 80);
+        assert_eq!(c.overflow_retries, 2);
+    }
+
+    #[test]
+    fn context_can_be_configured() {
+        let toml_str = r#"
+[agent.context]
+enabled = false
+memory_enabled = false
+head_turns = 1
+tail_turns = 3
+compact_trigger_pct = 70
+compact_target_pct = 40
+safety_margin_pct = 20
+tool_output_max_chars = 4000
+min_output_tokens = 1024
+max_summary_tokens = 900
+max_memory_entries = 20
+overflow_retries = 5
+"#;
+        let config: DaemonConfig = toml::from_str(toml_str).unwrap();
+        let c = &config.agent.context;
+        assert!(!c.enabled);
+        assert!(!c.memory_enabled);
+        assert_eq!(c.head_turns, 1);
+        assert_eq!(c.tail_turns, 3);
+        assert_eq!(c.compact_trigger_pct, 70);
+        assert_eq!(c.compact_target_pct, 40);
+        assert_eq!(c.safety_margin_pct, 20);
+        assert_eq!(c.tool_output_max_chars, 4_000);
+        assert_eq!(c.min_output_tokens, 1_024);
+        assert_eq!(c.max_summary_tokens, 900);
+        assert_eq!(c.max_memory_entries, 20);
+        assert_eq!(c.overflow_retries, 5);
+    }
+
+    #[test]
+    fn context_partial_config_keeps_other_defaults() {
+        let config: DaemonConfig = toml::from_str("[agent.context]\ntail_turns = 2\n").unwrap();
+        assert_eq!(config.agent.context.tail_turns, 2);
+        assert_eq!(config.agent.context.head_turns, 2);
+        assert!(config.agent.context.enabled);
     }
 }

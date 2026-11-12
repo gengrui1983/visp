@@ -399,27 +399,72 @@ fn guess_mime_type(path: &str) -> String {
     .to_string()
 }
 
-/// 估算文本的 token 数（基于 1 token ≈ 4 字符的近似值）
+/// 每张图片在 prompt 中的保守 token 预留。
+///
+/// 视觉模型的图片 token 由分辨率决定，无法从 base64 长度直接推导；
+/// 这里使用一个足够常见图片尺寸的保守上界，避免多模态请求被低估。
+pub const IMAGE_TOKEN_RESERVE: u32 = 1024;
+
+/// 每条消息的协议开销（role / 分隔符 / 格式标记）保守预留。
+pub const MESSAGE_OVERHEAD_TOKENS: u32 = 3;
+
+/// 估算文本的 token 数。
+///
+/// 不使用简单的 `bytes / 4`：它在 CJK 文本（UTF-8 每字 3 字节）和
+/// JSON / 代码标点上会显著低估，是本地 32k 模型出现服务端 400 的主因。
+/// 这里按字符类别分别估算：
+///
+/// - ASCII 字母/数字：约 4 字符 / token
+/// - ASCII 标点：约 2 字符 / token（JSON、代码、日志中的标点 token 化很差）
+/// - 非 ASCII（CJK、emoji 等）：约 1 字符 / token
+/// - 换行：1 token
+///
+/// 该估算刻意偏保守；真实 provider 上报的 usage 会进一步用于校准
+/// （见 `visp-context` 的会话级 calibration）。
 pub fn estimate_tokens(text: &str) -> u32 {
     if text.is_empty() {
         return 0;
     }
-    (text.len() as f64 / 4.0).ceil() as u32
+
+    let mut alnum: u64 = 0;
+    let mut punct: u64 = 0;
+    let mut non_ascii: u64 = 0;
+    let mut newlines: u64 = 0;
+
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            if ch == '\n' {
+                newlines += 1;
+            } else if ch.is_ascii_alphanumeric() {
+                alnum += 1;
+            } else if !ch.is_ascii_whitespace() {
+                punct += 1;
+            }
+        } else {
+            non_ascii += 1;
+        }
+    }
+
+    let estimated = alnum.div_ceil(4) + punct.div_ceil(2) + non_ascii + newlines;
+    estimated.max(1) as u32
 }
 
-/// 估算一条消息的 token 数，包括 role overhead 和 tool 字段
+/// 估算一条消息的 token 数，包括 role overhead、tool 字段和图片。
 pub fn estimate_message_tokens(msg: &Message) -> u32 {
-    let mut total = estimate_tokens(&msg.content) + 1; // +1 for role overhead
+    let mut total = estimate_tokens(&msg.content) + MESSAGE_OVERHEAD_TOKENS;
     if let Some(ref id) = msg.tool_call_id {
         total += estimate_tokens(id);
     }
     if let Some(ref calls) = msg.tool_calls {
         for call in calls {
-            total += estimate_tokens(&call.id)
+            // tool call 有额外结构开销（id/name/arguments/type 等）
+            total += 4
+                + estimate_tokens(&call.id)
                 + estimate_tokens(&call.name)
                 + estimate_tokens(&call.arguments);
         }
     }
+    total += msg.images.len() as u32 * IMAGE_TOKEN_RESERVE;
     total
 }
 

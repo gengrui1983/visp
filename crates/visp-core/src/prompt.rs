@@ -51,6 +51,35 @@ impl PromptBuilder {
         output_tokens: u32,
         trimmer: &dyn crate::context::ContextTrimmer,
     ) -> Vec<Message> {
+        Self::build_for_session(
+            None,
+            system_template,
+            rules,
+            history,
+            working_dir,
+            date_str,
+            max_context_tokens,
+            output_tokens,
+            0,
+            trimmer,
+        )
+    }
+
+    /// 与 [`build`](Self::build) 相同，但把会话 ID 传给裁剪器，
+    /// 使 token 校准、溢出压力和记忆写入按会话隔离。
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_for_session(
+        session_id: Option<&str>,
+        system_template: &str,
+        rules: &str,
+        history: &[Message],
+        working_dir: &Path,
+        date_str: &str,
+        max_context_tokens: Option<u32>,
+        output_tokens: u32,
+        extra_overhead_tokens: u32,
+        trimmer: &dyn crate::context::ContextTrimmer,
+    ) -> Vec<Message> {
         let mut system_content = match (system_template.is_empty(), rules.is_empty()) {
             (true, true) => USER_QUERY_INSTRUCTION.trim_start().to_string(),
             (true, false) => format!("## Instructions\n\n{rules}{USER_QUERY_INSTRUCTION}"),
@@ -67,7 +96,9 @@ impl PromptBuilder {
         system_content.push_str(&env_context);
 
         let system_msg = Message::system(system_content);
-        let system_tokens = system_msg.estimated_tokens;
+        let system_tokens = system_msg
+            .estimated_tokens
+            .saturating_add(extra_overhead_tokens);
 
         // 过滤 skip_context 消息
         let mut filtered: Vec<Message> = history
@@ -78,7 +109,13 @@ impl PromptBuilder {
 
         // 上下文裁剪（内部完成 Tool 输出截断）
         if let Some(max_ctx) = max_context_tokens {
-            filtered = trimmer.trim(&filtered, max_ctx, system_tokens, output_tokens);
+            filtered = trimmer.trim_for_session(
+                session_id,
+                &filtered,
+                max_ctx,
+                system_tokens,
+                output_tokens,
+            );
         }
 
         let mut messages = vec![system_msg];

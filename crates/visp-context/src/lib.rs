@@ -1,31 +1,673 @@
+//! Adaptive context management for visp.
+//!
+//! Responsibilities:
+//! 1. Estimate prompt size conservatively (CJK / code / JSON aware).
+//! 2. Learn a per-session calibration factor from provider-reported usage.
+//! 3. Compact (not merely drop) history near the limit into a structured
+//!    summary that preserves goal, facts, decisions, dead ends, work log and
+//!    next step.
+//! 4. Persist durable memory entries so details survive compaction and can be
+//!    retrieved later through the `memory` tool.
+//! 5. React to server-side "context too long" errors by increasing pressure
+//!    and letting the agent loop retry.
+
+mod compaction;
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
 use visp_core::context::ContextTrimmer;
-use visp_core::message::Message;
-use visp_core::message::Role;
-use visp_core::message::ToolCallRequest;
-use visp_core::message::estimate_message_tokens;
+use visp_core::memory::{MemoryEntry, MemoryStore, NewMemoryEntry};
+use visp_core::message::{Message, Role, estimate_message_tokens};
 
-const TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
-const PROTECTED_HEAD_TURNS: usize = 5;
-const PROTECTED_TAIL_TURNS: usize = 10;
+use compaction::{
+    build_summary, build_work_log, extract_notes, repair_tool_pairs, truncate_observation,
+    truncate_text_to_tokens,
+};
 
-/// 默认的对话历史裁剪器
-///
-/// 使用三段式策略（HEAD + MIDDLE（drop_old_turns）+ TAIL）进行裁剪，
-/// 极端情况回退到 keep_head_and_tail。
-pub struct DefaultContextTrimmer {
+/// Configuration for [`DefaultContextTrimmer`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextConfig {
     pub head_turns: usize,
     pub tail_turns: usize,
     pub tool_output_max_chars: usize,
+    /// Trigger compaction when the calibrated estimate reaches this percentage
+    /// of the available budget.
+    pub compact_trigger_pct: u8,
+    /// Target percentage after compaction (hysteresis: avoid compacting every
+    /// single iteration).
+    pub compact_target_pct: u8,
+    /// Extra headroom kept for estimator error.
+    pub safety_margin_pct: u8,
+    /// Minimum space reserved for the model's output.
+    pub min_output_tokens: u32,
+    /// Maximum tokens for the generated compaction summary.
+    pub max_summary_tokens: u32,
+    /// Maximum memory entries injected into the summary.
+    pub max_memory_entries: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            head_turns: 2,
+            tail_turns: 6,
+            tool_output_max_chars: 8_000,
+            compact_trigger_pct: 80,
+            compact_target_pct: 45,
+            safety_margin_pct: 12,
+            min_output_tokens: 2_000,
+            max_summary_tokens: 1_200,
+            max_memory_entries: 80,
+        }
+    }
+}
+
+impl From<&visp_config::config::ContextSection> for ContextConfig {
+    fn from(section: &visp_config::config::ContextSection) -> Self {
+        Self {
+            head_turns: section.head_turns,
+            tail_turns: section.tail_turns,
+            tool_output_max_chars: section.tool_output_max_chars,
+            compact_trigger_pct: section.compact_trigger_pct,
+            compact_target_pct: section.compact_target_pct,
+            safety_margin_pct: section.safety_margin_pct,
+            min_output_tokens: section.min_output_tokens,
+            max_summary_tokens: section.max_summary_tokens,
+            max_memory_entries: section.max_memory_entries,
+        }
+    }
+}
+
+/// Snapshot of the prompt produced by the last compaction.
+///
+/// The agent loop passes the **full** history on every iteration, so
+/// re-compacting every time would regenerate the summary and slide the
+/// retained tail — invalidating the provider's prompt cache on every turn.
+/// Remembering the compacted result lets us append new messages unchanged and
+/// only re-compact once the logical (compacted + appended) size reaches the
+/// trigger again.
+#[derive(Debug, Clone)]
+struct CompactionCheckpoint {
+    /// Length of the history prefix that produced `output`.
+    input_len: usize,
+    /// Base estimate of that prefix, used to detect a non-append-only history.
+    input_estimate: u32,
+    /// The compacted prompt (retained head + summary + retained tail).
+    output: Arc<Vec<Message>>,
+    /// Base estimate of `output` (without calibration).
+    output_estimate: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SessionState {
+    /// Multiplier applied to base estimates (actual / estimated).
+    ///
+    /// Deliberately never below 1.0: `UsageInfo.input_tokens` is not a
+    /// normalized prompt total (Anthropic excludes cache read/write tokens), so
+    /// `actual < estimated` can mean "most of the prompt was cached", not "the
+    /// estimator over-counted". Lowering the multiplier on that signal would
+    /// inflate the budget and trade a harmless waste of window for a possible
+    /// provider 400.
+    calibration: f64,
+    samples: u32,
+    /// Multiplier applied to the available budget after a server overflow.
+    pressure: f64,
+    overflow_level: u32,
+    /// Set after a server overflow: the next trim must compact even if the
+    /// (possibly underestimated) history appears to fit.
+    force_compact: bool,
+    compactions: u32,
+    /// Result of the last compaction, reused while the transcript stays under
+    /// the trigger (hysteresis).
+    compaction: Option<CompactionCheckpoint>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            calibration: 1.0,
+            samples: 0,
+            pressure: 1.0,
+            overflow_level: 0,
+            force_compact: false,
+            compactions: 0,
+            compaction: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionStates {
+    map: HashMap<String, SessionState>,
+    order: VecDeque<String>,
+    max_sessions: usize,
+}
+
+impl Default for SessionStates {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            max_sessions: 256,
+        }
+    }
+}
+
+impl SessionStates {
+    fn get(&mut self, key: &str) -> SessionState {
+        if !self.map.contains_key(key) {
+            if self.map.len() >= self.max_sessions
+                && let Some(old) = self.order.pop_front()
+            {
+                self.map.remove(&old);
+            }
+            self.map.insert(key.to_string(), SessionState::default());
+            self.order.push_back(key.to_string());
+        }
+        self.map.get(key).cloned().unwrap_or_default()
+    }
+
+    fn update(&mut self, key: &str, f: impl FnOnce(&mut SessionState)) {
+        let _ = self.get(key);
+        if let Some(state) = self.map.get_mut(key) {
+            f(state);
+        }
+    }
+}
+
+/// Default context trimmer.
+pub struct DefaultContextTrimmer {
+    pub config: ContextConfig,
+    memory: Option<Arc<dyn MemoryStore>>,
+    states: Mutex<SessionStates>,
 }
 
 impl Default for DefaultContextTrimmer {
     fn default() -> Self {
+        Self::new(ContextConfig::default(), None)
+    }
+}
+
+impl DefaultContextTrimmer {
+    pub fn new(config: ContextConfig, memory: Option<Arc<dyn MemoryStore>>) -> Self {
         Self {
-            head_turns: PROTECTED_HEAD_TURNS,
-            tail_turns: PROTECTED_TAIL_TURNS,
-            tool_output_max_chars: TOOL_OUTPUT_MAX_CHARS,
+            config,
+            memory,
+            states: Mutex::new(SessionStates::default()),
         }
     }
+
+    pub fn with_memory(config: ContextConfig, memory: Arc<dyn MemoryStore>) -> Self {
+        Self::new(config, Some(memory))
+    }
+
+    fn key(session_id: Option<&str>) -> String {
+        session_id.unwrap_or("__default__").to_string()
+    }
+
+    fn state(&self, session_id: Option<&str>) -> SessionState {
+        self.states
+            .lock()
+            .map(|mut states| states.get(&Self::key(session_id)))
+            .unwrap_or_default()
+    }
+
+    fn update_state(&self, session_id: Option<&str>, f: impl FnOnce(&mut SessionState)) {
+        if let Ok(mut states) = self.states.lock() {
+            states.update(&Self::key(session_id), f);
+        }
+    }
+
+    /// Available budget in estimated-token units.
+    fn effective_budget(
+        &self,
+        max_context_tokens: u32,
+        system_overhead: u32,
+        output_tokens: u32,
+        state: &SessionState,
+    ) -> u32 {
+        if max_context_tokens == 0 {
+            return 0;
+        }
+        let capped_output = output_tokens.min(max_context_tokens * 3 / 4);
+        let reserve = capped_output.max(self.config.min_output_tokens);
+        let available = max_context_tokens
+            .saturating_sub(reserve)
+            .saturating_sub(system_overhead);
+        let margin = self.config.safety_margin_pct.min(90) as u32;
+        let after_margin = available.saturating_mul(100 - margin) / 100;
+        let calibrated = after_margin as f64 / state.calibration.max(1.0);
+        (calibrated * state.pressure).max(1.0) as u32
+    }
+
+    fn trim_inner(
+        &self,
+        session_id: Option<&str>,
+        history: &[Message],
+        max_context_tokens: u32,
+        system_overhead: u32,
+        output_tokens: u32,
+    ) -> Vec<Message> {
+        if history.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state(session_id);
+        let budget =
+            self.effective_budget(max_context_tokens, system_overhead, output_tokens, &state);
+        let trigger = if state.force_compact {
+            0
+        } else {
+            budget.saturating_mul(self.config.compact_trigger_pct as u32) / 100
+        };
+        let target = budget.saturating_mul(self.config.compact_target_pct as u32) / 100;
+
+        let total = estimate_messages(history);
+
+        // Hysteresis: reuse the last compacted prompt while the transcript
+        // (compacted output + messages appended since) stays below the
+        // trigger. This keeps the prompt prefix stable across iterations.
+        if !state.force_compact
+            && let Some(checkpoint) = state.compaction.as_ref()
+        {
+            let prefix_unchanged = history.len() >= checkpoint.input_len
+                && estimate_messages(&history[..checkpoint.input_len]) == checkpoint.input_estimate;
+            if prefix_unchanged {
+                let appended = &history[checkpoint.input_len..];
+                let logical_total = checkpoint
+                    .output_estimate
+                    .saturating_add(estimate_messages(appended));
+                if logical_total <= trigger {
+                    let mut result = (*checkpoint.output).clone();
+                    result.extend_from_slice(appended);
+                    repair_tool_pairs(&mut result);
+                    let output_estimate = estimate_messages(&result);
+                    self.update_state(session_id, |s| {
+                        s.compaction = Some(CompactionCheckpoint {
+                            input_len: history.len(),
+                            input_estimate: total,
+                            output: Arc::new(result.clone()),
+                            output_estimate,
+                        });
+                    });
+                    return result;
+                }
+            } else {
+                // History is no longer an append-only extension of the
+                // checkpoint; discard it before it can return stale content.
+                self.update_state(session_id, |s| s.compaction = None);
+            }
+        }
+
+        if total <= trigger {
+            if state.compaction.is_some() {
+                self.update_state(session_id, |s| s.compaction = None);
+            }
+            return history.to_vec();
+        }
+
+        if state.force_compact {
+            // One forced compaction per overflow report; if it is still too
+            // long the next provider 400 will set the flag again.
+            self.update_state(session_id, |s| {
+                s.force_compact = false;
+                s.compaction = None;
+            });
+        }
+
+        let result = self.compact(session_id, history, target, &state);
+        // Remember which prefix produced this result so later iterations can
+        // append to it instead of re-summarizing the whole transcript.
+        let output_estimate = estimate_messages(&result);
+        self.update_state(session_id, |s| {
+            s.compaction = Some(CompactionCheckpoint {
+                input_len: history.len(),
+                input_estimate: total,
+                output: Arc::new(result.clone()),
+                output_estimate,
+            });
+        });
+        result
+    }
+
+    fn compact(
+        &self,
+        session_id: Option<&str>,
+        history: &[Message],
+        target: u32,
+        state: &SessionState,
+    ) -> Vec<Message> {
+        // Stage 1: keep both ends of oversized observations.
+        let work: Vec<Message> = history
+            .iter()
+            .cloned()
+            .map(|mut msg| {
+                if msg.role == Role::Tool {
+                    let truncated =
+                        truncate_observation(&msg.content, self.config.tool_output_max_chars);
+                    if truncated != msg.content {
+                        msg.content = truncated;
+                    }
+                }
+                msg
+            })
+            .collect();
+        if estimate_messages(&work) <= target {
+            return work;
+        }
+
+        let starts = turn_starts(&work);
+        if starts.is_empty() {
+            return keep_tail(&work, target);
+        }
+
+        let mut head_turns = self.config.head_turns.max(1).min(starts.len());
+        let mut tail_turns = self
+            .config
+            .tail_turns
+            .max(1)
+            .min(starts.len().saturating_sub(head_turns).max(1));
+
+        let goal = work
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.clone());
+        let next_step = work
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
+            .map(|m| m.content.clone());
+        let stored = self.load_memory(session_id);
+
+        loop {
+            let head_end = if starts.len() <= head_turns {
+                work.len()
+            } else {
+                starts[head_turns]
+            };
+            let tail_start = if starts.len() <= tail_turns {
+                0
+            } else {
+                starts[starts.len() - tail_turns]
+            };
+
+            if head_end < tail_start {
+                let middle = &work[head_end..tail_start];
+                let notes = extract_notes(middle);
+                self.persist_notes(session_id, &notes, head_end, tail_start);
+                let work_log = build_work_log(middle);
+                let summary = build_summary(
+                    middle.len(),
+                    goal.as_deref(),
+                    &notes,
+                    &work_log,
+                    next_step.as_deref(),
+                    &stored,
+                    self.config.max_summary_tokens,
+                );
+
+                let mut result = Vec::new();
+                result.extend_from_slice(&work[..head_end]);
+                result.push(Message::system(summary));
+                result.extend_from_slice(&work[tail_start..]);
+                repair_tool_pairs(&mut result);
+
+                if estimate_messages(&result) <= target || target == 0 {
+                    if state.pressure < 1.0 || state.overflow_level > 0 {
+                        self.update_state(session_id, |s| {
+                            s.compactions += 1;
+                        });
+                    }
+                    return result;
+                }
+
+                if tail_turns > 1 {
+                    tail_turns -= 1;
+                    continue;
+                }
+                if head_turns > 1 {
+                    head_turns -= 1;
+                    continue;
+                }
+
+                // Stage 2: hard-truncate retained messages (oldest first) while
+                // keeping at least the last user turn intact.
+                return self.shrink_to_fit(result, target);
+            }
+
+            if tail_turns > 1 {
+                tail_turns -= 1;
+            } else if head_turns > 1 {
+                head_turns -= 1;
+            } else {
+                break;
+            }
+        }
+
+        self.compact_fallback(session_id, &work, goal, next_step, &stored, target)
+    }
+
+    /// Last-resort compaction when there are too few turns for a middle
+    /// section (for example one user message followed by a single huge
+    /// assistant message). Keeps the task anchor, summarizes everything after
+    /// it, and appends as much of the newest tail as fits.
+    fn compact_fallback(
+        &self,
+        session_id: Option<&str>,
+        work: &[Message],
+        goal: Option<String>,
+        next_step: Option<String>,
+        stored: &[MemoryEntry],
+        target: u32,
+    ) -> Vec<Message> {
+        let anchor_end = work
+            .iter()
+            .position(|m| m.role == Role::User)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let rest = &work[anchor_end..];
+        let notes = extract_notes(rest);
+        self.persist_notes(session_id, &notes, anchor_end, work.len());
+        let work_log = build_work_log(rest);
+        let summary = build_summary(
+            rest.len(),
+            goal.as_deref(),
+            &notes,
+            &work_log,
+            next_step.as_deref(),
+            stored,
+            self.config.max_summary_tokens.max(200),
+        );
+
+        let mut result: Vec<Message> = work[..anchor_end].to_vec();
+        result.push(Message::system(summary));
+
+        // Keep the newest messages that still fit without splitting the tail.
+        let base = estimate_messages(&result);
+        let mut tail: Vec<Message> = Vec::new();
+        let mut tail_tokens = 0u32;
+        for msg in rest.iter().rev() {
+            let t = estimate_message_tokens(msg);
+            if base.saturating_add(tail_tokens).saturating_add(t) > target {
+                break;
+            }
+            tail_tokens += t;
+            tail.push(msg.clone());
+        }
+        tail.reverse();
+        result.extend(tail);
+        repair_tool_pairs(&mut result);
+
+        // A zero-token budget is degenerate (the window is entirely consumed
+        // by output reserve / system overhead). Returning the goal anchor is
+        // more useful than returning nothing.
+        if target > 0 && estimate_messages(&result) > target {
+            return self.shrink_to_fit(result, target);
+        }
+        result
+    }
+
+    fn shrink_to_fit(&self, mut messages: Vec<Message>, target: u32) -> Vec<Message> {
+        // Keep summary (index 1 usually) and the final user turn; compress the
+        // rest from oldest to newest so recent context stays intact.
+        let hard_cap = 3_000usize;
+        let len = messages.len();
+        for i in 0..len {
+            if estimate_messages(&messages) <= target {
+                break;
+            }
+            let is_summary = messages[i].role == Role::System;
+            let is_last_user = messages[i].role == Role::User
+                && messages[i + 1..].iter().all(|m| m.role != Role::User);
+            if is_summary || is_last_user {
+                continue;
+            }
+            if messages[i].content.chars().count() > hard_cap
+                || estimate_message_tokens(&messages[i]) > hard_cap as u32 / 3
+            {
+                messages[i].content = truncate_observation(&messages[i].content, hard_cap);
+            }
+        }
+        // Last resort: drop non-essential messages from the front (never the
+        // summary or the final user message).
+        while estimate_messages(&messages) > target && messages.len() > 2 {
+            let idx = messages
+                .iter()
+                .position(|m| m.role != Role::System && m.role != Role::User)
+                .or_else(|| {
+                    messages
+                        .iter()
+                        .enumerate()
+                        .find(|(i, m)| *i > 0 && m.role == Role::User)
+                        .map(|(i, _)| i)
+                });
+            match idx {
+                Some(i) if i + 1 < messages.len() => {
+                    messages.remove(i);
+                }
+                _ => break,
+            }
+        }
+
+        // Absolute fallback: anchor (goal) + summary + latest user message.
+        // `target` can be smaller than any real conversation turn, especially
+        // right after a server overflow; never return something over budget.
+        if estimate_messages(&messages) > target {
+            let goal = messages.iter().find(|m| m.role == Role::User).cloned();
+            let summary = messages.iter().find(|m| m.role == Role::System).cloned();
+            let last_user = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .cloned();
+
+            let mut minimal: Vec<Message> = Vec::new();
+            if let Some(mut m) = goal {
+                m.content = truncate_text_to_tokens(&m.content, target / 4);
+                minimal.push(m);
+            }
+            if let Some(mut m) = summary {
+                m.content = truncate_text_to_tokens(&m.content, target / 2);
+                minimal.push(m);
+            }
+            if let Some(mut m) = last_user {
+                m.content = truncate_text_to_tokens(&m.content, target / 4);
+                if !minimal.iter().any(|other| other.content == m.content) {
+                    minimal.push(m);
+                }
+            }
+            if !minimal.is_empty() {
+                messages = minimal;
+            }
+        }
+
+        repair_tool_pairs(&mut messages);
+        messages
+    }
+
+    fn load_memory(&self, session_id: Option<&str>) -> Vec<visp_core::memory::MemoryEntry> {
+        let (Some(session_id), Some(store)) = (session_id, self.memory.as_ref()) else {
+            return Vec::new();
+        };
+        store
+            .list(session_id, self.config.max_memory_entries)
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id, error = %e, "failed to load task memory");
+                Vec::new()
+            })
+    }
+
+    fn persist_notes(
+        &self,
+        session_id: Option<&str>,
+        notes: &[compaction::MemoryNote],
+        start: usize,
+        end: usize,
+    ) {
+        let (Some(session_id), Some(store)) = (session_id, self.memory.as_ref()) else {
+            return;
+        };
+        let source = format!("messages[{start}..{end}]");
+        for note in notes {
+            let entry = NewMemoryEntry::new(session_id, note.kind, note.content.clone())
+                .with_source(source.clone());
+            if let Err(e) = store.append(entry) {
+                tracing::warn!(session_id, error = %e, "failed to persist task memory");
+                break;
+            }
+        }
+    }
+}
+
+fn estimate_messages(messages: &[Message]) -> u32 {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// Find the start index of each logical turn.
+///
+/// A user message always starts a turn and the first assistant reply belongs to
+/// it. Subsequent assistant messages (the tool-call steps of an agent loop) are
+/// separate turns even without an intervening user message. This is what makes
+/// `head_turns` / `tail_turns` work for the common real-world transcript:
+/// one user message followed by dozens of assistant/tool rounds.
+fn turn_starts(messages: &[Message]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut turn_has_assistant = false;
+    for (i, msg) in messages.iter().enumerate() {
+        match msg.role {
+            Role::User => {
+                starts.push(i);
+                turn_has_assistant = false;
+            }
+            Role::Assistant => {
+                if starts.is_empty() || turn_has_assistant {
+                    starts.push(i);
+                }
+                turn_has_assistant = true;
+            }
+            Role::System | Role::Tool => {}
+        }
+    }
+    starts
+}
+
+/// Keep the newest suffix that fits the budget (used when there is no turn
+/// boundary to compact around, e.g. a tool-only transcript).
+fn keep_tail(messages: &[Message], target: u32) -> Vec<Message> {
+    let mut result: Vec<Message> = Vec::new();
+    let mut used = 0u32;
+    for msg in messages.iter().rev() {
+        let t = estimate_message_tokens(msg);
+        if used.saturating_add(t) > target {
+            break;
+        }
+        used += t;
+        result.push(msg.clone());
+    }
+    result.reverse();
+    repair_tool_pairs(&mut result);
+    result
 }
 
 impl ContextTrimmer for DefaultContextTrimmer {
@@ -36,759 +678,86 @@ impl ContextTrimmer for DefaultContextTrimmer {
         system_overhead: u32,
         output_tokens: u32,
     ) -> Vec<Message> {
-        if history.is_empty() {
-            return vec![];
+        self.trim_inner(
+            None,
+            history,
+            max_context_tokens,
+            system_overhead,
+            output_tokens,
+        )
+    }
+
+    fn trim_for_session(
+        &self,
+        session_id: Option<&str>,
+        history: &[Message],
+        max_context_tokens: u32,
+        system_overhead: u32,
+        output_tokens: u32,
+    ) -> Vec<Message> {
+        self.trim_inner(
+            session_id,
+            history,
+            max_context_tokens,
+            system_overhead,
+            output_tokens,
+        )
+    }
+
+    fn observe_usage(&self, session_id: Option<&str>, estimated_input: u32, actual_input: u32) {
+        if estimated_input == 0 || actual_input == 0 {
+            return;
         }
-
-        let available = calculate_available(max_context_tokens, output_tokens);
-        let budget = available.saturating_sub(system_overhead);
-
-        let result = if budget == 0 {
-            keep_head_and_tail(history, 0, self.tool_output_max_chars)
-        } else {
-            let total_tokens =
-                estimate_messages_tokens_for_prompt(history, self.tool_output_max_chars);
-            if total_tokens <= budget {
-                history.to_vec()
+        let sample = actual_input as f64 / estimated_input as f64;
+        if !(0.2..=8.0).contains(&sample) {
+            return;
+        }
+        self.update_state(session_id, |state| {
+            // Only calibrate upward. A sub-unit sample is ambiguous (see
+            // `SessionState::calibration`): treating it as overestimation would
+            // enlarge the budget exactly when cache accounting made the
+            // reported input smaller than the real prompt.
+            state.calibration = if state.samples == 0 {
+                sample.clamp(1.0, 6.0)
             } else {
-                let head_end = find_head_end(history, self.head_turns);
-                let tail_start = find_tail_start(history, self.tail_turns);
+                state.calibration.max(sample).clamp(1.0, 6.0)
+            };
+            state.samples += 1;
+            // A successful provider call with known usage means the pressure
+            // is no longer needed; calibration carries the correction forward.
+            state.pressure = 1.0;
+            state.overflow_level = 0;
+            state.force_compact = false;
+        });
+    }
 
-                // HEAD 和 TAIL 重叠 → 使用 keep_head_and_tail
-                if head_end >= tail_start {
-                    keep_head_and_tail(history, budget, self.tool_output_max_chars)
-                } else {
-                    let head = &history[..head_end];
-                    let middle = &history[head_end..tail_start];
-                    let tail = &history[tail_start..];
+    fn on_context_overflow(&self, session_id: Option<&str>) -> u32 {
+        let mut level = 0;
+        self.update_state(session_id, |state| {
+            state.pressure = (state.pressure * 0.7).max(0.25);
+            state.overflow_level += 1;
+            state.force_compact = true;
+            level = state.overflow_level;
+        });
+        level
+    }
 
-                    let head_tokens: u32 = head
-                        .iter()
-                        .map(|m| estimate_message_tokens_for_prompt(m, self.tool_output_max_chars))
-                        .sum();
-                    let tail_tokens: u32 = tail
-                        .iter()
-                        .map(|m| estimate_message_tokens_for_prompt(m, self.tool_output_max_chars))
-                        .sum();
-
-                    if head_tokens + tail_tokens > budget {
-                        keep_head_and_tail(history, budget, self.tool_output_max_chars)
-                    } else {
-                        let mid_budget = budget - head_tokens - tail_tokens;
-                        let trimmed_middle =
-                            drop_old_turns(middle, mid_budget, self.tool_output_max_chars);
-
-                        let mut result =
-                            Vec::with_capacity(head.len() + trimmed_middle.len() + tail.len());
-                        result.extend_from_slice(head);
-                        result.extend(trimmed_middle);
-                        result.extend_from_slice(tail);
-                        result
-                    }
-                }
+    fn reset_context_pressure(&self, session_id: Option<&str>) {
+        self.update_state(session_id, |state| {
+            state.pressure = (state.pressure * 1.15).min(1.0);
+            if state.pressure >= 1.0 {
+                state.overflow_level = 0;
             }
-        };
-
-        // 裁剪完成后，对 Tool 消息执行输出截断
-        let mut result = result;
-        for msg in &mut result {
-            if msg.role == Role::Tool {
-                let truncated = truncate_tool_output(&msg.content, self.tool_output_max_chars);
-                if truncated != msg.content {
-                    msg.content = truncated;
-                    msg.estimated_tokens = estimate_message_tokens(msg);
-                }
-            }
-        }
-        result
-    }
-}
-
-// ========== 辅助函数 ==========
-
-/// max_context_tokens 是 effective limit（含预留）
-/// 只减去 max(output_tokens, 4000) 作为输出保留空间
-/// output_tokens 上限为 max_context_tokens 的 75%，确保至少 25% 用于输入
-pub(crate) fn calculate_available(max_context_tokens: u32, output_tokens: u32) -> u32 {
-    let capped_output = output_tokens.min(max_context_tokens * 3 / 4);
-    max_context_tokens.saturating_sub(capped_output.max(4_000))
-}
-
-/// 估算消息列表中每条消息在 prompt 中的实际 token 数
-/// - 非 Tool 消息：直接返回 msg.estimated_tokens
-/// - Tool 消息超过 max_chars：按截断后长度估算
-pub(crate) fn estimate_message_tokens_for_prompt(msg: &Message, max_chars: usize) -> u32 {
-    if msg.role == Role::Tool && msg.content.chars().count() > max_chars {
-        ((max_chars as f64 / 4.0).ceil() as u32) + 1
-    } else {
-        msg.estimated_tokens
-    }
-}
-
-/// 批量版本
-pub(crate) fn estimate_messages_tokens_for_prompt(messages: &[Message], max_chars: usize) -> u32 {
-    messages
-        .iter()
-        .map(|m| estimate_message_tokens_for_prompt(m, max_chars))
-        .sum()
-}
-
-/// 截断工具输出到 max_chars 字符（按字符计数，不是字节）
-/// 使用 chars().take() 保证 Unicode 安全
-pub(crate) fn truncate_tool_output(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
-        content.to_string()
-    } else {
-        let truncated: String = content.chars().take(max_chars).collect();
-        format!("{}... (truncated)", truncated)
-    }
-}
-
-/// 返回第 n+1 轮起点索引（轮次由 User 消息位置识别）
-/// 如果不足 n 轮 User 消息，返回 history.len()
-pub(crate) fn find_head_end(history: &[Message], n: usize) -> usize {
-    let user_positions: Vec<usize> = history
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
-        .map(|(i, _)| i)
-        .collect();
-
-    if user_positions.len() <= n {
-        return history.len();
-    }
-    user_positions[n]
-}
-
-/// 返回倒数第 n 轮起点索引（轮次由 User 消息位置识别）
-/// 如果不足 n 轮，返回 0
-pub(crate) fn find_tail_start(history: &[Message], n: usize) -> usize {
-    let user_positions: Vec<usize> = history
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
-        .map(|(i, _)| i)
-        .collect();
-
-    let len = user_positions.len();
-    if len < n {
-        return 0;
-    }
-    user_positions[len - n]
-}
-
-/// 从前往后删除完整轮次，直到预算满足或无可删除。
-/// 一个"轮次"从 User 开始到下一个 User 之前结束。
-/// 返回裁剪后的消息列表。
-pub(crate) fn drop_old_turns(messages: &[Message], budget: u32, max_chars: usize) -> Vec<Message> {
-    if messages.is_empty() {
-        return vec![];
+        });
     }
 
-    let mut tokens = estimate_messages_tokens_for_prompt(messages, max_chars);
-    if tokens <= budget {
-        return messages.to_vec();
+    fn estimate_tokens(&self, session_id: Option<&str>, messages: &[Message]) -> u32 {
+        let base = estimate_messages(messages);
+        let state = self.state(session_id);
+        (base as f64 * state.calibration.max(1.0)) as u32
     }
-
-    let mut start = 0;
-    loop {
-        // 找到第一个 User
-        let first_user = messages[start..].iter().position(|m| m.role == Role::User);
-        let Some(first_idx) = first_user.map(|i| i + start) else {
-            break;
-        };
-
-        // 找到第二个 User（轮次边界）
-        let second_user = messages[first_idx + 1..]
-            .iter()
-            .position(|m| m.role == Role::User);
-        let Some(boundary) = second_user.map(|i| i + first_idx + 1) else {
-            break; // 不足一个完整轮次
-        };
-
-        // 删除 messages[start..boundary]
-        let removed_tokens: u32 = messages[start..boundary]
-            .iter()
-            .map(|m| estimate_message_tokens_for_prompt(m, max_chars))
-            .sum();
-
-        start = boundary;
-        tokens = tokens.saturating_sub(removed_tokens);
-
-        if tokens <= budget {
-            break;
-        }
-    }
-
-    messages[start..].to_vec()
-}
-
-/// 极端情况：HEAD+TAIL 已超预算时使用。
-/// 保留首条 User + 尾部最近消息，过滤孤立 ToolResult。
-pub(crate) fn keep_head_and_tail(
-    history: &[Message],
-    budget: u32,
-    max_chars: usize,
-) -> Vec<Message> {
-    if history.is_empty() {
-        return vec![];
-    }
-
-    // 找到第一条 User 消息
-    let first_user_idx = match history.iter().position(|m| m.role == Role::User) {
-        Some(idx) => idx,
-        None => return vec![],
-    };
-
-    let first_user_tokens = estimate_message_tokens_for_prompt(&history[first_user_idx], max_chars);
-    if first_user_tokens > budget {
-        return vec![history[first_user_idx].clone()];
-    }
-
-    let mut remaining = budget - first_user_tokens;
-    let mut tail_indices: Vec<usize> = Vec::new();
-    let mut confirmed_tool_ids: Vec<String> = Vec::new();
-
-    // 从尾往前遍历
-    for i in (first_user_idx + 1..history.len()).rev() {
-        let msg = &history[i];
-        let tokens = estimate_message_tokens_for_prompt(msg, max_chars);
-        if tokens <= remaining {
-            tail_indices.push(i);
-            remaining -= tokens;
-            // 收集 Assistant 消息的 tool_calls
-            if msg.role == Role::Assistant
-                && let Some(ref calls) = msg.tool_calls
-            {
-                for call in calls {
-                    confirmed_tool_ids.push(call.id.clone());
-                }
-            }
-        }
-    }
-
-    // 反转得到原始顺序
-    tail_indices.reverse();
-
-    // 构建 confirmed_tool_ids 集合（被保留的 assistant tool_calls 需要对应的 tool_result）
-    let confirmed_ids_set: std::collections::HashSet<&str> =
-        confirmed_tool_ids.iter().map(|s| s.as_str()).collect();
-
-    // 收集结果中实际存在的 tool_call_ids（从 Tool 消息）
-    let mut present_tool_call_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for &i in &tail_indices {
-        let msg = &history[i];
-        if msg.role == Role::Tool
-            && let Some(ref call_id) = msg.tool_call_id
-        {
-            present_tool_call_ids.insert(call_id.clone());
-        }
-    }
-
-    // 过滤：移除孤儿 ToolResult 和孤儿 ToolCall
-    let filtered_indices: Vec<usize> = tail_indices
-        .into_iter()
-        .filter(|&i| {
-            let msg = &history[i];
-            if msg.role == Role::Tool {
-                // orphan ToolResult：没有匹配的 assistant tool_call
-                if let Some(ref call_id) = msg.tool_call_id {
-                    return confirmed_ids_set.contains(call_id.as_str());
-                }
-                return false;
-            }
-            if msg.role == Role::Assistant
-                && let Some(ref calls) = msg.tool_calls
-            {
-                // orphan ToolCall：assistant tool_calls 存在但 tool_result 不在结果中
-                // 如果所有 tool_calls 的 id 都不在 present_tool_call_ids 中，过滤掉这个 assistant
-                let any_result_present =
-                    calls.iter().any(|c| present_tool_call_ids.contains(&c.id));
-                if !any_result_present {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    // 构建结果
-    let mut result = vec![history[first_user_idx].clone()];
-
-    if let Some(&first_tail_idx) = filtered_indices.first() {
-        if first_tail_idx > first_user_idx + 1 {
-            result.push(Message::system(
-                "[... earlier messages omitted due to context limit ...]",
-            ));
-        }
-        for &i in &filtered_indices {
-            result.push(history[i].clone());
-        }
-    }
-
-    // 修复：将 assistant 消息的 tool_calls 中，没有对应 tool_result 的条目移除。
-    // 防止因部分 tool_result 被裁剪导致 API 400 错误
-    // ("An assistant message with 'tool_calls' must be followed by tool messages")
-    let result_tool_ids: std::collections::HashSet<String> = result
-        .iter()
-        .filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.clone())
-        .collect();
-
-    for msg in &mut result {
-        if msg.role == Role::Assistant
-            && let Some(ref calls) = msg.tool_calls.clone()
-        {
-            let valid: Vec<ToolCallRequest> = calls
-                .iter()
-                .filter(|c| result_tool_ids.contains(&c.id))
-                .cloned()
-                .collect();
-            if valid.is_empty() {
-                msg.tool_calls = None;
-            } else if valid.len() < calls.len() {
-                msg.tool_calls = Some(valid);
-            }
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use visp_core::message::ToolCallRequest;
-
-    // ---- 1: DefaultContextTrimmer ----
-
-    #[test]
-    fn test_default_trimmer_default_values() {
-        let trimmer = DefaultContextTrimmer::default();
-        assert_eq!(trimmer.head_turns, 5);
-        assert_eq!(trimmer.tail_turns, 10);
-        assert_eq!(trimmer.tool_output_max_chars, 8000);
-    }
-
-    #[test]
-    fn test_default_context_trimmer_implements_trait() {
-        // 验证实现了 ContextTrimmer trait
-        fn assert_trimmer<T: ContextTrimmer>() {}
-        assert_trimmer::<DefaultContextTrimmer>();
-
-        // 验证可以通过 trait object 使用
-        let trimmer: Box<dyn ContextTrimmer> = Box::new(DefaultContextTrimmer::default());
-        let result = trimmer.trim(&[], 1000, 0, 100);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_default_context_trimmer_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DefaultContextTrimmer>();
-
-        let trimmer: Box<dyn ContextTrimmer + Send + Sync> =
-            Box::new(DefaultContextTrimmer::default());
-        let _arc = std::sync::Arc::new(trimmer);
-    }
-
-    // ---- 2: Token 估算 + 预算 + 截断 ----
-
-    #[test]
-    fn test_estimate_msg_tokens_for_prompt_user() {
-        let msg = Message::user("hello world");
-        assert_eq!(
-            estimate_message_tokens_for_prompt(&msg, 8000),
-            msg.estimated_tokens
-        );
-    }
-
-    #[test]
-    fn test_estimate_msg_tokens_for_prompt_short_tool() {
-        let msg = Message::tool("short output", "call_1");
-        assert_eq!(
-            estimate_message_tokens_for_prompt(&msg, 8000),
-            msg.estimated_tokens
-        );
-    }
-
-    #[test]
-    fn test_estimate_msg_tokens_for_prompt_long_tool() {
-        let long = "a".repeat(9000);
-        let msg = Message::tool(&long, "id");
-        assert_eq!(estimate_message_tokens_for_prompt(&msg, 8000), 2001);
-    }
-
-    #[test]
-    fn test_estimate_messages_tokens_for_prompt_empty() {
-        assert_eq!(estimate_messages_tokens_for_prompt(&[], 8000), 0);
-    }
-
-    #[test]
-    fn test_calculate_available_standard() {
-        assert_eq!(calculate_available(128_000, 4_000), 124_000);
-    }
-
-    #[test]
-    fn test_calculate_available_high_output() {
-        assert_eq!(calculate_available(128_000, 8_000), 120_000);
-    }
-
-    #[test]
-    fn test_calculate_available_output_exceeds_context() {
-        // Bug: max_tokens (output) >= max_context_tokens caused available=0,
-        // trimmer stripped all history → LLM infinite loop
-        let available = calculate_available(128_000, 128_000);
-        assert!(available > 0, "available must be > 0 when context > 0");
-        assert_eq!(available, 32_000); // 25% reserved for input
-    }
-
-    #[test]
-    fn test_truncate_tool_output_short() {
-        assert_eq!(truncate_tool_output("short", 8000), "short");
-    }
-
-    #[test]
-    fn test_truncate_tool_output_long() {
-        let long = "x".repeat(9000);
-        let result = truncate_tool_output(&long, 8000);
-        let expected_prefix: String = "x".repeat(8000);
-        assert!(result.starts_with(&expected_prefix));
-        assert!(result.len() > 8000);
-        assert!(result.contains("truncated"));
-    }
-
-    #[test]
-    fn test_truncate_tool_output_unicode() {
-        let chinese = "你好".repeat(4500); // 9000 chars
-        let result = truncate_tool_output(&chinese, 8000);
-        let expected_prefix: String = "你好".repeat(4000); // 8000 chars
-        assert!(result.starts_with(&expected_prefix));
-        assert!(result.contains("truncated"));
-    }
-
-    // ---- 3: 边界函数 ----
-
-    #[test]
-    fn test_find_head_end_two_turns_n1() {
-        let history = vec![
-            Message::user("q1"),
-            Message::assistant("a1"),
-            Message::user("q2"),
-            Message::assistant("a2"),
-        ];
-        assert_eq!(find_head_end(&history, 1), 2);
-    }
-
-    #[test]
-    fn test_find_head_end_not_enough_turns() {
-        let history = vec![Message::user("q1"), Message::assistant("a1")];
-        assert_eq!(find_head_end(&history, 5), 2);
-    }
-
-    #[test]
-    fn test_find_head_end_empty() {
-        let history: Vec<Message> = vec![];
-        assert_eq!(find_head_end(&history, 2), 0);
-    }
-
-    #[test]
-    fn test_find_tail_start_two_turns_n2() {
-        let history = vec![
-            Message::user("q1"),
-            Message::assistant("a1"),
-            Message::user("q2"),
-            Message::assistant("a2"),
-        ];
-        // 总共 2 轮，倒数第 2 轮即第 1 轮起点
-        assert_eq!(find_tail_start(&history, 2), 0);
-    }
-
-    #[test]
-    fn test_find_tail_start_empty() {
-        let history: Vec<Message> = vec![];
-        assert_eq!(find_tail_start(&history, 2), 0);
-    }
-
-    // ---- 4: drop_old_turns ----
-
-    #[test]
-    fn test_drop_old_turns_empty() {
-        let result = drop_old_turns(&[], 1000, 8000);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_drop_old_turns_all_fit() {
-        let history = vec![
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        let result = drop_old_turns(&history, 1000, 8000);
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0], Message::user("u1"));
-        assert_eq!(result[1], Message::assistant("a1"));
-        assert_eq!(result[2], Message::user("u2"));
-        assert_eq!(result[3], Message::assistant("a2"));
-    }
-
-    #[test]
-    fn test_drop_old_turns_drop_one_turn() {
-        // budget=4 drops [U1,A1] (~4 tokens), leaving [U2,A2] (~4 tokens) which fits
-        let history = vec![
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        let result = drop_old_turns(&history, 4, 8000);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], Message::user("u2"));
-        assert_eq!(result[1], Message::assistant("a2"));
-    }
-
-    #[test]
-    fn test_drop_old_turns_budget_zero() {
-        // Can't drop all — last partial turn [U2,A2] remains
-        let history = vec![
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        let result = drop_old_turns(&history, 0, 8000);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], Message::user("u2"));
-        assert_eq!(result[1], Message::assistant("a2"));
-    }
-
-    #[test]
-    fn test_drop_old_turns_not_enough_for_turn() {
-        // Single turn [U1,A1] — no second User to form a complete turn boundary
-        let history = vec![Message::user("u1"), Message::assistant("a1")];
-        let result = drop_old_turns(&history, 0, 8000);
-        assert_eq!(result.len(), 2);
-    }
-
-    // ---- 5: keep_head_and_tail ----
-
-    #[test]
-    fn test_keep_head_and_tail_all_fit() {
-        let history = vec![
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        let result = keep_head_and_tail(&history, 1000, 8000);
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0], Message::user("u1"));
-    }
-
-    #[test]
-    fn test_keep_head_and_tail_filter_orphan_tool() {
-        let a1 = Message::assistant("a1");
-        // A1 has no tool_calls, so TR1 with call_a is orphaned
-        let tr1 = Message::tool("tr1", "call_a");
-        let history = vec![
-            Message::user("u1"),
-            a1,
-            tr1.clone(),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        // Budget=12: fits all but TR1 is orphan (no corresponding Assistant tool_calls)
-        let result = keep_head_and_tail(&history, 12, 8000);
-        assert_eq!(result.len(), 4, "TR1 should be filtered as orphan");
-        assert_eq!(result[0], Message::user("u1"));
-        assert_eq!(result[1], Message::assistant("a1"));
-        // TR1 should NOT be in result
-        assert_eq!(result[2], Message::user("u2"));
-        assert_eq!(result[3], Message::assistant("a2"));
-    }
-
-    #[test]
-    fn test_keep_head_and_tail_confirmed_tool_kept() {
-        let mut a1 = Message::assistant("a1");
-        a1.tool_calls = Some(vec![ToolCallRequest {
-            id: "call_a".to_string(),
-            name: "tool".to_string(),
-            arguments: "{}".to_string(),
-        }]);
-        a1.estimated_tokens = estimate_message_tokens(&a1);
-        let tr1 = Message::tool("tr1", "call_a");
-        let history = vec![
-            Message::user("u1"),
-            a1,
-            tr1.clone(),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        // Budget=16: all fit, TR1 call_id matches A1's tool_calls → kept
-        let result = keep_head_and_tail(&history, 16, 8000);
-        assert_eq!(result.len(), 5, "TR1 should be kept (confirmed by A1)");
-        assert_eq!(result[0], Message::user("u1"));
-        assert_eq!(result[1].role, Role::Assistant);
-        assert_eq!(result[2], tr1);
-    }
-
-    #[test]
-    fn test_keep_head_and_tail_empty() {
-        let result = keep_head_and_tail(&[], 1000, 8000);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_keep_head_and_tail_no_user() {
-        let history = vec![Message::assistant("a1")];
-        let result = keep_head_and_tail(&history, 1000, 8000);
-        assert!(result.is_empty());
-    }
-
-    // ---- 6: keep_head_and_tail orphan tool_call filter ----
-
-    #[test]
-    fn test_keep_head_and_tail_filter_orphan_toolcall() {
-        // Assistant 的 tool_call 在结果中，但 tool_result 不在 → tool_call 应被过滤
-        let mut a1 = Message::assistant("a1");
-        a1.tool_calls = Some(vec![ToolCallRequest {
-            id: "call_a".to_string(),
-            name: "tool".to_string(),
-            arguments: "{}".to_string(),
-        }]);
-        a1.estimated_tokens = estimate_message_tokens(&a1);
-        let history = vec![
-            Message::user("u1"),
-            a1.clone(),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        // budget=12: 从后往前，u2(2)+a2(2)+a1(2) fits, u1(2) fits
-        // 但 a1 有 tool_calls("call_a")，没有对应的 tool_result → 应被过滤
-        let result = keep_head_and_tail(&history, 12, 8000);
-        // a1 应该被过滤掉（orphan tool_call）
-        assert!(
-            !result
-                .iter()
-                .any(|m| m.role == Role::Assistant && m.tool_calls.is_some()),
-            "orphan tool_call should be filtered"
-        );
-        assert_eq!(result[0], Message::user("u1"));
-    }
-
-    #[test]
-    fn test_keep_head_and_tail_orphan_toolcall_but_keep_result() {
-        // 正常情况：assistant tool_call 和 tool_result 都在结果中 → 都保留
-        let mut a1 = Message::assistant("a1");
-        a1.tool_calls = Some(vec![ToolCallRequest {
-            id: "call_a".to_string(),
-            name: "tool".to_string(),
-            arguments: "{}".to_string(),
-        }]);
-        a1.estimated_tokens = estimate_message_tokens(&a1);
-        let tr1 = Message::tool("tr1", "call_a");
-        let history = vec![
-            Message::user("u1"),
-            a1.clone(),
-            tr1.clone(),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        // budget=20: u1(2)+a1(6)+tr1(4)+u2(2)+a2(2) = 16, all fit
-        let result = keep_head_and_tail(&history, 20, 8000);
-        // a1 和 tr1 应该都被保留
-        let has_call = result
-            .iter()
-            .any(|m| m.role == Role::Assistant && m.tool_calls.is_some());
-        assert!(has_call, "confirmed tool_call should be kept");
-        let has_result = result.iter().any(|m| m.role == Role::Tool);
-        assert!(has_result, "confirmed tool_result should be kept");
-    }
-
-    // ---- 7: trim (via DefaultContextTrimmer) ----
-
-    #[test]
-    fn test_trim_context_all_fit() {
-        let trimmer = DefaultContextTrimmer::default();
-        let history = vec![
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-        ];
-        let result = trimmer.trim(&history, 128_000, 20, 4096);
-        assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn test_trim_context_head_middle_tail() {
-        let trimmer = DefaultContextTrimmer::default();
-        // Create enough turns to exercise HEAD+MIDDLE+TAIL strategy
-        let mut history: Vec<Message> = Vec::new();
-        // Add 20 User-Assistant pairs
-        for i in 1..=20 {
-            history.push(Message::user(format!("u{}", i)));
-            history.push(Message::assistant(format!("a{}", i)));
-        }
-        // Budget must be enough for HEAD+TAIL but not MIDDLE
-        let result = trimmer.trim(&history, 70000, 0, 4096);
-        // Should be a valid result (either keep_head_and_tail or HEAD+trimmed+TAIL)
-        assert!(!result.is_empty());
-        assert!(result.len() <= history.len());
-        // First message should be the first User
-        assert_eq!(result[0].role, Role::User);
-    }
-
-    #[test]
-    fn test_trim_context_empty() {
-        let trimmer = DefaultContextTrimmer::default();
-        let result = trimmer.trim(&[], 1000, 20, 100);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_trim_context_zero_budget() {
-        let trimmer = DefaultContextTrimmer::default();
-        let history = vec![Message::user("u1"), Message::assistant("a1")];
-        let result = trimmer.trim(&history, 0, 0, 0);
-        // budget=0 → falls back to keep_head_and_tail
-        assert!(!result.is_empty());
-        assert_eq!(result[0].role, Role::User);
-    }
-
-    #[test]
-    fn test_trim_truncates_tool_output() {
-        let trimmer = DefaultContextTrimmer::default();
-        let long_output = "x".repeat(9000);
-        let tool_msg = Message::tool(&long_output, "call_1");
-        let history = vec![Message::user("u1"), tool_msg];
-        let result = trimmer.trim(&history, 128_000, 20, 4096);
-        // Tool message should be truncated
-        let tool_result = &result[1]; // user + tool
-        assert_eq!(tool_result.role, Role::Tool);
-        assert!(tool_result.content.len() < 9000);
-        assert!(tool_result.content.contains("truncated"));
-    }
-
-    #[test]
-    fn test_trim_truncates_tool_output_custom_max_chars() {
-        // 自定义参数：tool_output_max_chars=100 时，Tool 消息按 100 字符截断
-        let trimmer = DefaultContextTrimmer {
-            head_turns: 5,
-            tail_turns: 10,
-            tool_output_max_chars: 100,
-        };
-        let long_output = "x".repeat(500);
-        let tool_msg = Message::tool(&long_output, "call_1");
-        let history = vec![Message::user("u1"), tool_msg];
-        let result = trimmer.trim(&history, 128_000, 20, 4096);
-        let tool_result = &result[1];
-        assert_eq!(tool_result.role, Role::Tool);
-        assert!(tool_result.content.starts_with(&"x".repeat(100)));
-        assert!(!tool_result.content.contains(&"x".repeat(101)));
-        assert!(tool_result.content.contains("truncated"));
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

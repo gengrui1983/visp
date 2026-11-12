@@ -4990,3 +4990,213 @@ async fn test_pre_tool_use_not_emitted_on_truncated_arguments() {
         "truncated arguments should still emit a Truncated ToolCallResult"
     );
 }
+
+// ── Context overflow self-healing ───────────────────────────────────────────
+
+/// Trimmer that only shrinks after the server reported an overflow.
+struct OverflowAwareTrimmer {
+    overflow_calls: AtomicUsize,
+}
+
+impl crate::context::ContextTrimmer for OverflowAwareTrimmer {
+    fn trim(&self, h: &[Message], _: u32, _: u32, _: u32) -> Vec<Message> {
+        h.to_vec()
+    }
+
+    fn trim_for_session(
+        &self,
+        _session_id: Option<&str>,
+        h: &[Message],
+        max_ctx: u32,
+        overhead: u32,
+        output: u32,
+    ) -> Vec<Message> {
+        if self.overflow_calls.load(Ordering::SeqCst) == 0 {
+            h.to_vec()
+        } else {
+            // Aggressive compacted view: goal + summary only.
+            let _ = (max_ctx, overhead, output);
+            vec![Message::user(
+                "[compacted] goal: inspect the large log file",
+            )]
+        }
+    }
+
+    fn on_context_overflow(&self, _session_id: Option<&str>) -> u32 {
+        self.overflow_calls.fetch_add(1, Ordering::SeqCst) as u32 + 1
+    }
+}
+
+struct OverflowThenOkProvider {
+    calls: AtomicUsize,
+    messages_on_success: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for OverflowThenOkProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+        _config: &LlmConfig,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatEvent, LlmError>> + Send>>, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            return Err(LlmError::Api {
+                status: 400,
+                message: "This model's maximum context length is 32768 tokens".into(),
+            });
+        }
+        self.messages_on_success
+            .store(messages.len(), Ordering::SeqCst);
+        let events: Vec<Result<ChatEvent, LlmError>> = vec![
+            Ok(ChatEvent::TextDelta("done after compaction".into())),
+            Ok(ChatEvent::UsageInfo {
+                input_tokens: 100,
+                output_tokens: 10,
+                tool_calls: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cost: None,
+            }),
+            Ok(ChatEvent::Done),
+        ];
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+#[serial]
+#[tokio::test]
+async fn test_agent_loop_self_heals_from_context_overflow() {
+    use crate::rules::RuleEngine;
+    use crate::session::InMemorySessionStore;
+    use crate::tool_registry::ToolRegistry;
+    use std::path::Path;
+
+    let session_mgr = std::sync::Arc::new(SessionManager::new(InMemorySessionStore::new()));
+    let session = session_mgr
+        .create(Path::new("/tmp"), LlmConfig::default())
+        .unwrap();
+    let sid = session.id.clone();
+    for i in 0..6 {
+        session_mgr
+            .append_message(&sid, Message::user(format!("long history message {i}")))
+            .unwrap();
+        session_mgr
+            .append_message(&sid, Message::assistant(format!("long answer {i}")))
+            .unwrap();
+    }
+
+    let trimmer = std::sync::Arc::new(OverflowAwareTrimmer {
+        overflow_calls: AtomicUsize::new(0),
+    });
+    let ctx_trimmer: std::sync::Arc<dyn crate::context::ContextTrimmer + Send + Sync> =
+        trimmer.clone();
+    let ctx = session_mgr
+        .start_loop(&sid, &ctx_trimmer, None, None)
+        .unwrap();
+
+    let provider = std::sync::Arc::new(OverflowThenOkProvider {
+        calls: AtomicUsize::new(0),
+        messages_on_success: AtomicUsize::new(0),
+    });
+    let provider_dyn: std::sync::Arc<dyn LlmProvider> = provider.clone();
+    let rule_engine = std::sync::Arc::new(RuleEngine::new(Path::new("/tmp")).unwrap());
+    let registry = std::sync::Arc::new(ToolRegistry::new());
+    let config = AgentConfig {
+        hard_limit: 2,
+        context_overflow_retries: 2,
+        ..Default::default()
+    };
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
+
+    run_agent_loop(
+        provider_dyn,
+        registry,
+        rule_engine,
+        session_mgr.clone(),
+        ctx,
+        &config,
+        Message::user("inspect the log"),
+        tx,
+    )
+    .await;
+
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "expected one overflow retry"
+    );
+    assert_eq!(
+        trimmer.overflow_calls.load(Ordering::SeqCst),
+        1,
+        "on_context_overflow must be invoked"
+    );
+    assert!(
+        provider.messages_on_success.load(Ordering::SeqCst) <= 2,
+        "retry should see the compacted prompt"
+    );
+
+    let mut saw_error = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentEvent::Error { .. }) {
+            saw_error = true;
+        }
+    }
+    assert!(!saw_error, "overflow should not surface as a session error");
+    let final_session = session_mgr.get(&sid).unwrap();
+    assert!(
+        final_session
+            .history
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.content.contains("done after compaction")),
+        "agent should continue to a conclusion"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_agent_loop_overflow_exhausted_reports_error() {
+    use crate::rules::RuleEngine;
+    use crate::session::InMemorySessionStore;
+    use crate::tool_registry::ToolRegistry;
+    use std::path::Path;
+
+    let session_mgr = std::sync::Arc::new(SessionManager::new(InMemorySessionStore::new()));
+    let session = session_mgr
+        .create(Path::new("/tmp"), LlmConfig::default())
+        .unwrap();
+    let sid = session.id.clone();
+    let trimmer: std::sync::Arc<dyn crate::context::ContextTrimmer + Send + Sync> =
+        std::sync::Arc::new(Phase2MockTrimmer);
+    let ctx = session_mgr.start_loop(&sid, &trimmer, None, None).unwrap();
+
+    let provider = std::sync::Arc::new(OverflowThenOkProvider {
+        calls: AtomicUsize::new(0),
+        messages_on_success: AtomicUsize::new(0),
+    });
+    let provider_dyn: std::sync::Arc<dyn LlmProvider> = provider.clone();
+    let rule_engine = std::sync::Arc::new(RuleEngine::new(Path::new("/tmp")).unwrap());
+    let registry = std::sync::Arc::new(ToolRegistry::new());
+    let config = AgentConfig {
+        hard_limit: 2,
+        context_overflow_retries: 0,
+        ..Default::default()
+    };
+    let (tx, _rx) = mpsc::channel::<AgentEvent>(128);
+
+    run_agent_loop(
+        provider_dyn,
+        registry,
+        rule_engine,
+        session_mgr,
+        ctx,
+        &config,
+        Message::user("inspect the log"),
+        tx,
+    )
+    .await;
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}

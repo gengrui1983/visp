@@ -5,7 +5,7 @@ pub struct Migrator;
 
 impl Migrator {
     /// Current schema version (incremented on each migration).
-    pub const VERSION: i64 = 6;
+    pub const VERSION: i64 = 7;
 
     /// SQL to create the session table.
     const CREATE_SESSION: &'static str = r#"
@@ -55,8 +55,22 @@ impl Migrator {
         );
     "#;
 
+    /// SQL to create the durable task-memory table.
+    const CREATE_CONTEXT_MEMORY: &'static str = r#"
+        CREATE TABLE IF NOT EXISTS context_memory (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            source      TEXT,
+            created_at  INTEGER NOT NULL,
+            UNIQUE(session_id, kind, content)
+        );
+    "#;
+
     /// Indexes for performance.
     const INDEXES: &'static [&'static str] = &[
+        "CREATE INDEX IF NOT EXISTS idx_context_memory_session ON context_memory(session_id, id);",
         "CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, id);",
         "CREATE INDEX IF NOT EXISTS idx_message_session_role ON message(session_id, role);",
         "CREATE INDEX IF NOT EXISTS idx_message_tool_call ON message(tool_call_id);",
@@ -83,6 +97,7 @@ impl Migrator {
         // Create tables
         conn.execute_batch(Self::CREATE_SESSION)?;
         conn.execute_batch(Self::CREATE_MESSAGE)?;
+        conn.execute_batch(Self::CREATE_CONTEXT_MEMORY)?;
 
         // Ensure all columns exist (idempotent via pragma_table_info checks).
         // Runs unconditionally — not gated on current_version — to self-heal

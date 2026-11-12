@@ -13,6 +13,7 @@ use visp_core::{
     agent::{AgentConfig, AgentTool, Envelope},
     agent_registry::AgentRegistry,
     context::ContextTrimmer,
+    memory::{InMemoryMemoryStore, MemoryStore},
     provider::LlmProvider,
     rules::RuleEngine,
     session::{InMemorySessionStore, SessionManager, SessionStatus, SessionStore},
@@ -29,6 +30,7 @@ use visp_tools::{
     },
     fetch::WebFetch,
     file::{EditFile, ReadFile, WriteFile},
+    memory::MemoryTool,
     search::{Glob, Grep},
 };
 
@@ -257,6 +259,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "LLM configured"
     );
 
+    // 3.5. Durable task memory store.
+    // The SQLite implementation shares the session DB file (separate
+    // connection, WAL); on failure we degrade to in-process memory rather than
+    // preventing the daemon from starting.
+    let memory_store: Arc<dyn MemoryStore> = match config.storage.driver.as_str() {
+        "sqlite" => match visp_db::SqliteMemoryStore::open(&config.storage.path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open memory store; using in-memory fallback");
+                Arc::new(InMemoryMemoryStore::new())
+            }
+        },
+        _ => Arc::new(InMemoryMemoryStore::new()),
+    };
+
     // 4. Create tool registry
     let tool_registry = ToolRegistry::new();
 
@@ -323,6 +340,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register(Arc::new(visp_tools::skill::SkillTool::new(&cwd)))
         .map_err(|e| format!("register skill: {e}"))?;
 
+    // ── 持久任务记忆工具（压缩后仍可检索关键事实/决定/死路）──
+    if config.agent.context.memory_enabled {
+        tool_registry
+            .register(Arc::new(MemoryTool::new(memory_store.clone())))
+            .map_err(|e| format!("register memory: {e}"))?;
+    }
+
     let tool_registry = Arc::new(tool_registry);
 
     // ── 锁定核心工具（MCP 工具不能覆盖这些名称）──
@@ -376,15 +400,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Create rule engine
     let rule_engine = Arc::new(RuleEngine::new(&cwd)?);
 
-    // 6.5. Create context trimmer
-    // 无配置项时使用默认值；如需自定义，可通过结构体字面量注入：
-    //   DefaultContextTrimmer { head_turns, tail_turns, tool_output_max_chars }
-    let context_trimmer: Arc<dyn ContextTrimmer + Send + Sync> =
-        Arc::new(visp_context::DefaultContextTrimmer {
-            head_turns: 5,
-            tail_turns: 10,
-            tool_output_max_chars: 8_000,
-        });
+    // 6.5. Create context trimmer (adaptive estimation + structured compaction
+    // + durable memory). Disabling `agent.context.enabled` restores old no-op
+    // behavior for debugging.
+    let context_trimmer: Arc<dyn ContextTrimmer + Send + Sync> = if config.agent.context.enabled {
+        let memory = if config.agent.context.memory_enabled {
+            Some(memory_store.clone())
+        } else {
+            None
+        };
+        Arc::new(visp_context::DefaultContextTrimmer::new(
+            visp_context::ContextConfig::from(&config.agent.context),
+            memory,
+        ))
+    } else {
+        Arc::new(visp_core::context::NoopTrimmer)
+    };
 
     // 7. Create session manager
     let store: Box<dyn SessionStore> = match config.storage.driver.as_str() {
@@ -462,6 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         doom_loop_threshold: config.agent.doom_loop_threshold,
         llm_retry_attempts: config.agent.llm_retry_attempts,
         llm_retry_base_delay_ms: config.agent.llm_retry_base_delay_ms,
+        context_overflow_retries: config.agent.context.overflow_retries,
         bash_confirm_mode: config.agent.bash_confirm_mode,
         file_max_size_bytes: config.agent.file_max_size_bytes,
         max_depth: config.agent.max_depth,
