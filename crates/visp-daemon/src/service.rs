@@ -1770,6 +1770,19 @@ async fn replay_session_history_from(
     Ok(())
 }
 
+/// 验证阶段 → proto 稳定字符串（跨语言消费方按此判断，不依赖 Display/调试格式）。
+fn verification_stage_str(stage: visp_core::agent::VerificationStage) -> &'static str {
+    use visp_core::agent::VerificationStage;
+    match stage {
+        VerificationStage::Started => "started",
+        VerificationStage::Passed => "passed",
+        VerificationStage::Failed => "failed",
+        VerificationStage::Rework => "rework",
+        VerificationStage::Exhausted => "exhausted",
+        VerificationStage::Inconclusive => "inconclusive",
+    }
+}
+
 fn agent_event_to_server_message(
     event: AgentEvent,
     session_id: &str,
@@ -1938,6 +1951,29 @@ fn agent_event_to_server_message(
             payload: Some(proto::server_message::Payload::ImageError(
                 proto::ImageError {
                     reason,
+                    session_id: sid,
+                    agent_name: aname,
+                },
+            )),
+        }),
+        AgentEvent::Verification(v) => Some(proto::ServerMessage {
+            payload: Some(proto::server_message::Payload::VerificationUpdate(
+                proto::VerificationUpdate {
+                    stage: verification_stage_str(v.stage).to_string(),
+                    round: v.round,
+                    max_rounds: v.max_rounds,
+                    summary: v.summary,
+                    evidence: v
+                        .evidence
+                        .into_iter()
+                        .map(|e| proto::VerificationEvidence {
+                            check: e.check,
+                            method: e.method,
+                            result: e.result,
+                        })
+                        .collect(),
+                    is_final: v.is_final,
+                    passed: v.passed.unwrap_or(false),
                     session_id: sid,
                     agent_name: aname,
                 },
@@ -2811,6 +2847,63 @@ mod tests {
             requires_approval: false,
         };
         assert!(agent_event_to_server_message(event, "sess-1", "").is_none());
+    }
+
+    #[test]
+    fn test_agent_event_to_server_message_verification_is_structured() {
+        use visp_core::agent::{VerificationEvidence, VerificationStage, VerificationUpdate};
+
+        let event = AgentEvent::Verification(VerificationUpdate {
+            stage: VerificationStage::Exhausted,
+            round: 2,
+            max_rounds: 1,
+            summary: "核心场景仍未满足".into(),
+            evidence: vec![VerificationEvidence {
+                check: "10 万行 CSV 查询".into(),
+                method: "实际运行".into(),
+                result: "失败".into(),
+            }],
+            is_final: true,
+            passed: Some(false),
+        });
+        let msg = agent_event_to_server_message(event, "sess-1", "verifier").unwrap();
+        match msg.payload {
+            Some(proto::server_message::Payload::VerificationUpdate(v)) => {
+                assert_eq!(v.stage, "exhausted");
+                assert_eq!((v.round, v.max_rounds), (2, 1));
+                assert!(v.is_final);
+                assert!(!v.passed, "最终未通过必须可被非交互入口区分");
+                assert_eq!(v.session_id, "sess-1");
+                assert_eq!(v.agent_name, "verifier");
+                assert_eq!(v.evidence.len(), 1);
+                assert_eq!(v.evidence[0].check, "10 万行 CSV 查询");
+            }
+            other => panic!("expected VerificationUpdate payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agent_event_to_server_message_inconclusive_is_distinct() {
+        use visp_core::agent::{VerificationStage, VerificationUpdate};
+
+        let event = AgentEvent::Verification(VerificationUpdate {
+            stage: VerificationStage::Inconclusive,
+            round: 1,
+            max_rounds: 2,
+            summary: "验证者未提交结构化结论（步数用尽）".into(),
+            evidence: vec![],
+            is_final: true,
+            passed: Some(false),
+        });
+        let msg = agent_event_to_server_message(event, "sess-1", "verifier").unwrap();
+        match msg.payload {
+            Some(proto::server_message::Payload::VerificationUpdate(v)) => {
+                assert_eq!(v.stage, "inconclusive", "非交互入口必须能区分「没做成」");
+                assert!(v.is_final);
+                assert!(!v.passed, "没做成也绝不能当作通过");
+            }
+            other => panic!("expected VerificationUpdate payload, got {other:?}"),
+        }
     }
 
     #[test]

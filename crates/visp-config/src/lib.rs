@@ -10,9 +10,10 @@ pub use config::{
     AgentSection, BuiltinAgentConfig, DaemonConfig, DaemonSection, LangfuseCaptureConfig,
     LangfuseConfig, LlmConfig, LlmModelConfig, LlmSection, McpConfig, McpServerConfig,
     McpTransport, ModelInfo, NotificationProtocol, NotificationSection, ObservabilityConfig,
-    OtlpConfig, StorageSection, ToolsSection, apply_config_update, apply_model_override,
-    build_llm_config_from_model, init_config, load_config, merge_session_config,
-    model_config_to_info, proto_to_llm_config, resolve_model, resolve_model_key, save_config,
+    OtlpConfig, StorageSection, ToolsSection, VerifierSection, apply_config_update,
+    apply_model_override, build_llm_config_from_model, init_config, load_config,
+    merge_session_config, model_config_to_info, proto_to_llm_config, resolve_model,
+    resolve_model_key, save_config,
 };
 pub use hooks::{
     DEFAULT_HOOK_TIMEOUT_MS, HookConfigError, HookRule, HookScope, HooksConfig, OnFull,

@@ -5352,6 +5352,7 @@ version = "0.5.5"
 dependencies = [
  "chrono",
  "clap",
+ "futures",
  "serde",
  "tempfile",
  "tokio",

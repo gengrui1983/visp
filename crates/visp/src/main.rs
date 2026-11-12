@@ -56,9 +56,13 @@ enum LauncherCommand {
     ///
     /// The answer is printed on stdout, progress on stderr. The prompt is
     /// taken from the arguments, or from stdin when none (or "-") is given.
-    /// Exit code: 0 done, 1 agent error, 3 daemon stream lost, 130 interrupted.
+    /// Exit code: 0 done + verification passed (or not triggered), 1 agent or
+    /// runtime error, 2 command-line usage error (clap's own parse errors
+    /// included), 3 daemon stream lost, 4 verification could not complete,
+    /// 5 verification rejected the result, 130 interrupted.
     Run {
-        /// Approve every tool request once (without it, all are denied).
+        /// Approve every tool request once, including the verifier's / sub-agents'
+        /// (without it, all are denied).
         #[arg(short = 'y', long)]
         yes: bool,
         /// The prompt (or "-" / nothing to read it from stdin).
@@ -265,13 +269,13 @@ async fn run_once(cli: &Cli, approve: bool, words: &[String]) -> i32 {
 
     if cli.session.is_some() {
         eprintln!("[visp run] --session is not supported yet; each run starts a new session");
-        return 2;
+        return run_cmd::EXIT_USAGE;
     }
     let prompt = match run_cmd::resolve_prompt(words, std::io::stdin()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[visp run] {e}");
-            return 2;
+            return run_cmd::EXIT_USAGE;
         }
     };
 
@@ -363,8 +367,20 @@ async fn run_once(cli: &Cli, approve: bool, words: &[String]) -> i32 {
 
     let code = match outcome {
         Ok(o) => {
-            if let run_cmd::RunOutcome::AgentError { code, message } = &o {
-                eprintln!("[visp run] agent error {code}: {message}");
+            match &o {
+                run_cmd::RunOutcome::AgentError { code, message } => {
+                    eprintln!("[visp run] agent error {code}: {message}");
+                }
+                run_cmd::RunOutcome::VerificationFailed { summary } => {
+                    eprintln!("[verification] ❌ 任务完成，但独立验证未通过：{summary}");
+                }
+                run_cmd::RunOutcome::VerificationIncomplete { summary } => {
+                    eprintln!("[verification] ⚠️ 任务完成，但独立验证未完成：{summary}");
+                    eprintln!(
+                        "[verification] 验证没做成不能当作通过；请检查 verifier 的 max_steps / timeout_secs 或使用 --yes 放行其命令。"
+                    );
+                }
+                _ => {}
             }
             o.exit_code()
         }
@@ -722,8 +738,59 @@ mod tests {
     }
 
     #[test]
+    fn run_yes_and_prompt_words_parse() {
+        let cli = Cli::try_parse_from(["visp", "run", "-y", "fix", "the", "bug"]).unwrap();
+        match cli.command {
+            Some(LauncherCommand::Run { yes, prompt }) => {
+                assert!(yes, "-y 必须能放行审批（包括验证者的命令）");
+                assert_eq!(prompt, vec!["fix", "the", "bug"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(cli.project, ".", "全局参数在 subcommand 后仍可解析");
+    }
+
+    #[test]
+    fn run_without_prompt_reads_stdin_later() {
+        let cli = Cli::try_parse_from(["visp", "run"]).unwrap();
+        match cli.command {
+            Some(LauncherCommand::Run { yes, prompt }) => {
+                assert!(!yes);
+                assert!(prompt.is_empty(), "空参数表示从 stdin 读取");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_subcommand_defaults_to_none() {
         let cli = Cli::try_parse_from(["visp"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    /// clap exits with 2 when the command line cannot be parsed, before
+    /// `run_once` is ever called. That value is therefore reserved for usage
+    /// errors; `visp run` results must never reuse it.
+    #[test]
+    fn clap_parse_failure_uses_the_reserved_usage_exit_code() {
+        let err = match Cli::try_parse_from(["visp", "run", "--bogus-flag", "x"]) {
+            Ok(_) => panic!("未知参数必须解析失败"),
+            Err(e) => e,
+        };
+        assert_eq!(err.exit_code(), run_cmd::EXIT_USAGE);
+        assert_eq!(
+            run_cmd::EXIT_USAGE,
+            2,
+            "clap 的解析错误固定是 2，不能改成别的含义"
+        );
+    }
+
+    /// Unsupported flag combinations are usage errors too, so `visp run`
+    /// reports the same 2 as clap instead of a separate code.
+    #[tokio::test]
+    async fn unsupported_session_flag_is_a_usage_error() {
+        let cli = Cli::try_parse_from(["visp", "-s", "abc", "run"]).unwrap();
+        let code = run_once(&cli, false, &["hi".to_string()]).await;
+        assert_eq!(code, run_cmd::EXIT_USAGE);
     }
 }

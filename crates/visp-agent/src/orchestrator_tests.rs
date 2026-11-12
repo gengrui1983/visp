@@ -4098,3 +4098,7 @@ async fn test_sub_session_error_is_not_treated_as_stale() {
         "子会话错误收尾应置为 Error"
     );
 }
+
+#[cfg(test)]
+#[path = "orchestrator_verifier_tests.rs"]
+mod verifier_tests;

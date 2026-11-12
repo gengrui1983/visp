@@ -224,6 +224,7 @@ mod tests {
                 ServerPayload::ImageBlock(_) => "image_block",
                 ServerPayload::ImageError(_) => "image_error",
                 ServerPayload::UsageDelta(_) => "usage_delta",
+                ServerPayload::VerificationUpdate(_) => "verification_update",
             }
         }
 
@@ -262,6 +263,7 @@ mod tests {
             ServerPayload::ImageBlock(Default::default()),
             ServerPayload::ImageError(Default::default()),
             ServerPayload::UsageDelta(Default::default()),
+            ServerPayload::VerificationUpdate(Default::default()),
         ];
         let server_names: Vec<_> = server_variants.iter().map(server_variant).collect();
         assert_eq!(
@@ -280,6 +282,7 @@ mod tests {
                 "image_block",
                 "image_error",
                 "usage_delta",
+                "verification_update",
             ]
         );
     }

@@ -6,10 +6,11 @@ edition.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 chrono.workspace = true
+futures.workspace = true
 serde.workspace = true
 tokio.workspace = true
-toml = "0.8"
 tokio-stream.workspace = true
+toml = "0.8"
 tonic.workspace = true
 visp-proto = { path = "../visp-proto" }
 visp-config = { path = "../visp-config" }

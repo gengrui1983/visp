@@ -4,3 +4,4 @@ pub mod builtin_agents;
 pub mod event_bus;
 pub mod observability;
 pub mod orchestrator;
+pub mod verifier;

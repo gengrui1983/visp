@@ -13,6 +13,7 @@ chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures.workspace = true
 prost.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -23,5 +24,4 @@ visp-config = { path = "../visp-config" }
 visp-proto = { path = "../visp-proto" }
 
 [dev-dependencies]
-serde_json.workspace = true
 serial_test = "3"

@@ -85,6 +85,9 @@ fn event_to_msg(event: &AgentEvent) -> Option<AgentMessage> {
             cache_read_input_tokens: *cache_read_input_tokens,
         }),
         AgentEvent::StatusUpdate(s) => Some(AgentMessage::StatusUpdate(s.clone())),
+        // 独立验证：不转发。验证事件由 orchestrator 直接发布到总线，
+        // 不经 AgentMessage 二次转发。
+        AgentEvent::Verification(_) => None,
         AgentEvent::Error { code, message } => Some(AgentMessage::Error {
             code: code.clone(),
             message: message.clone(),

@@ -243,6 +243,7 @@ message ServerMessage {
         ImageBlock image_block = 11;      // LLM 输出的图片
         ImageError image_error = 12;      // 图片处理失败
         UsageDelta usage_delta = 13;      // LLM token 增量（实时速率展示）
+        VerificationUpdate verification_update = 14;  // 独立验证进度/结论
     }
 }
 
@@ -307,6 +308,31 @@ message StatusUpdate {
     // 是否为"仅查看"模式。为 true 时 CLI 端只显示状态更新，
     // 不改变输入框状态或触发其他交互行为。
     bool view_only = 5;
+}
+
+// 独立验证进度/结论。非交互入口（如一次性任务）判断最终状态的
+// 结构化载体：CLI/调用方可据此区分"仍在验证"与"已有最终结论"，
+// 而不必依赖 StatusUpdate 的纯文本。
+message VerificationUpdate {
+    // 阶段：started | passed | failed | rework | exhausted
+    string stage = 1;
+    uint32 round = 2;
+    uint32 max_rounds = 3;
+    string summary = 4;
+    repeated VerificationEvidence evidence = 5;
+    // 是否为最终结论
+    bool is_final = 6;
+    // 最终是否通过；仅 is_final=true 时有意义
+    bool passed = 7;
+    string session_id = 8;
+    string agent_name = 9;
+}
+
+// 单条验证证据：某项检查及其执行方法与结果。
+message VerificationEvidence {
+    string check = 1;
+    string method = 2;
+    string result = 3;
 }
 
 // 错误消息。daemon 处理用户输入过程中发生错误时发送。

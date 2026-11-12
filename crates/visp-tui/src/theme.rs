@@ -65,6 +65,9 @@ pub const STATUS_FG: Color = Color::DarkGray;
 /// 子 Agent 调用块文字（紫色调，与普通工具调用区分）
 pub const AGENT_CALL_FG: Color = Color::Magenta;
 
+/// 独立验证进度/结论（蓝色，与状态行和工具行区分）
+pub const VERIFICATION_FG: Color = Color::Cyan;
+
 /// notice 文字
 pub const INPUT_NOTICE_FG: Color = Color::DarkGray;
 pub const INPUT_FG: Color = Color::White;
@@ -275,6 +278,7 @@ pub fn fg_for(line_type: LineType) -> Color {
         LineType::AgentCall { .. } => AGENT_CALL_FG,
         LineType::Error => ERROR_FG,
         LineType::Status => STATUS_FG,
+        LineType::Verification => VERIFICATION_FG,
         LineType::Usage => TOOL_RESULT_FG,
         LineType::Image { .. } => ASSISTANT_FG,
     }
@@ -291,7 +295,7 @@ pub fn style_for(line_type: LineType) -> BlockStyle {
         LineType::ToolError { .. } => TOOL_ERROR_STYLE,
         LineType::AgentCall { .. } => AGENT_CALL_STYLE,
         LineType::Usage => USAGE_STYLE,
-        LineType::Error | LineType::Status => TOOL_STYLE,
+        LineType::Error | LineType::Status | LineType::Verification => TOOL_STYLE,
         LineType::Image { .. } => ASSISTANT_STYLE,
     }
 }

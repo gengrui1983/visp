@@ -301,6 +301,8 @@ pub enum LineType {
     },
     Error,
     Status,
+    /// 独立验证进度/结论
+    Verification,
     Usage,
     Image {
         path: String,
@@ -729,6 +731,12 @@ impl TabEntry {
                     }
                     // 增量语义：仅传增量文本，前缀与追加语义由 update_thinking 统一处理
                     self.update_thinking(tb.thinking);
+                }
+                Some(server_message::Payload::VerificationUpdate(vu)) => {
+                    self.flush_streaming();
+                    for line in format_verification_lines(&vu) {
+                        self.push_chat_line(LineType::Verification, line, None);
+                    }
                 }
                 Some(server_message::Payload::StatusUpdate(su)) => {
                     // NOTE: user_inputs handling deferred to later step
@@ -1424,6 +1432,42 @@ pub struct ModelSelectState {
     pub state: ListState,
 }
 
+/// 把结构化验证事件渲染为若干 ChatLine 文本（UI 层不解析模型输出，只展示结构化字段）。
+pub(crate) fn format_verification_lines(v: &visp_proto::visp::VerificationUpdate) -> Vec<String> {
+    let head = match v.stage.as_str() {
+        "started" => format!(
+            "🔍 独立验证：从原始需求出发验证改动（第 {} 轮，返工上限 {}）",
+            v.round, v.max_rounds
+        ),
+        "passed" => format!("✅ 验证通过：{}", v.summary),
+        "failed" => {
+            if v.is_final {
+                format!("❌ 验证未通过：{}", v.summary)
+            } else {
+                format!("❌ 验证未通过（将继续返工）：{}", v.summary)
+            }
+        }
+        "rework" => format!("↩ {}", v.summary),
+        "exhausted" => format!(
+            "❌ 验证未通过（已用尽 {} 轮返工）：{}",
+            v.max_rounds, v.summary
+        ),
+        "inconclusive" => format!("⚠️ 验证未完成（验证没做成，不是发现缺陷）：{}", v.summary),
+        other => format!("[验证 {}] {}", other, v.summary),
+    };
+    let mut lines = vec![head];
+    if !v.evidence.is_empty() {
+        lines.push("证据：".to_string());
+        for ev in &v.evidence {
+            lines.push(format!(
+                "  - 检查：{}；方法：{}；结果：{}",
+                ev.check, ev.method, ev.result
+            ));
+        }
+    }
+    lines
+}
+
 /// 从 ServerMessage 中提取 (session_id, agent_name)。
 /// 没有 agent_name 字段的 payload 返回空字符串。
 fn extract_session_and_agent(msg: &ServerMessage) -> (String, String) {
@@ -1447,6 +1491,9 @@ fn extract_session_and_agent(msg: &ServerMessage) -> (String, String) {
             (d.session_id.clone(), d.agent_name.clone())
         }
         Some(server_message::Payload::ImageError(d)) => {
+            (d.session_id.clone(), d.agent_name.clone())
+        }
+        Some(server_message::Payload::VerificationUpdate(d)) => {
             (d.session_id.clone(), d.agent_name.clone())
         }
         None => (String::new(), String::new()),

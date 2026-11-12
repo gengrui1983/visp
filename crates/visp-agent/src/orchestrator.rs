@@ -7,19 +7,20 @@
 //! - 管理子 Agent 的创建（spawn_sub_agent）、销毁（handle_done）、取消（cancel_agent）
 //! - 管理 pending_queries 将用户响应路由到对应 agent
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing;
 use tracing::Instrument;
 
 use visp_core::agent::run_agent_loop;
 use visp_core::agent::{
     AgentConfig, AgentEvent, AgentEventFrame, AgentKind, AgentLoopContext, AgentMessage, Envelope,
-    OrchestratorMessage, UserQueryResult,
+    OrchestratorMessage, UserQueryResult, VerificationUpdate,
 };
 use visp_core::agent_definition::{AgentDefinition, merge_permissions};
 use visp_core::agent_registry::AgentRegistry;
@@ -27,7 +28,7 @@ use visp_core::bus::{BusEvent, EventPublisher};
 use visp_core::context::ContextTrimmer;
 use visp_core::error::{AgentErrorCode, SessionError};
 use visp_core::message::Message;
-use visp_core::provider::LlmProvider;
+use visp_core::provider::{LlmConfig, LlmProvider};
 use visp_core::rules::RuleEngine;
 use visp_core::session::{SessionManager, SessionStatus, SubSessionParams};
 use visp_core::tool::ToolType;
@@ -42,9 +43,13 @@ use visp_hooks::{
 use visp_observability::{LangfuseSpanConfig, init_span};
 
 use crate::active_agent::{ActiveAgent, ActiveAgentRegistry};
+use crate::verifier::{
+    VERIFIER_AGENT_NAME, VerificationReport, VerifierConfig, VerifierRunRequest,
+    extract_changed_path, is_mutating_tool, run_verifier,
+};
 
 /// 根据 allowed_sub_agents 筛选子 Agent 的工具列表
-fn filter_tools_for_sub_agent(
+pub(crate) fn filter_tools_for_sub_agent(
     tool_registry: &ToolRegistry,
     allowed_sub_agents: &[String],
 ) -> Arc<ToolRegistry> {
@@ -110,6 +115,74 @@ fn build_subagent_prompt(registry: &AgentRegistry) -> String {
 
 /// 取消信号
 pub struct CancelSignal;
+
+/// 从任意会话沿 `parent_session_id` 上溯到根会话。
+///
+/// 独立验证以「根回合」为单位：主 agent 或其子 agent 成功写文件，都应触发根回合验证。
+/// 找不到父链（会话已清理/环）时返回起点。
+pub(crate) fn root_ancestor(registry: &ActiveAgentRegistry, session_id: &str) -> String {
+    let mut current = session_id.to_string();
+    for _ in 0..64 {
+        match registry
+            .get(&current)
+            .and_then(|a| a.parent_session_id.clone())
+        {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
+}
+
+/// 一次根回合的验证状态（按根 session 保存）。
+struct TurnVerificationState {
+    /// 回合代号：新用户消息递增；迟到的验证结果若代号不匹配则丢弃。
+    turn_id: u64,
+    /// 本轮用户的原始请求（返工时不覆盖，验证者始终以它为准）。
+    original_request: String,
+    /// 本回合是否成功修改过项目文件。
+    modified: bool,
+    /// 成功修改过的文件路径（用于构造验证者上下文）。
+    changed_paths: BTreeSet<String>,
+    /// 已使用的返工轮数。
+    rework_used: u32,
+    /// 当前验证者子会话 id（用于取消/清理）。
+    verifier_session: Option<String>,
+    /// 验证者取消令牌（与 session_mgr 的令牌相互独立，仅用于标记）。
+    cancel_token: CancellationToken,
+    /// 用户已取消本回合；验证结果到达后不得再返工。
+    cancelled: bool,
+    /// 主 agent 的 Done 已被扣住、等待验证收尾（此时 root Done 尚未发给客户端）。
+    done_withheld: bool,
+}
+
+/// 构造返工提示：把验证者的具体问题交回主 agent。
+fn build_rework_prompt(report: &VerificationReport) -> String {
+    let mut out = String::from(
+        "独立验证未通过。请先阅读下面的验证结论与证据，修正真实需求未满足的部分，         然后重新完成本回合。不要只重跑你自己写的测试，也不要只改注释或文档。\n\n",
+    );
+    out.push_str("## 验证结论\n");
+    out.push_str(&report.summary);
+    out.push('\n');
+    if !report.evidence.is_empty() {
+        out.push_str("\n## 证据\n");
+        for ev in &report.evidence {
+            out.push_str(&format!(
+                "- 检查：{}\n  方法：{}\n  结果：{}\n",
+                ev.check, ev.method, ev.result
+            ));
+        }
+    }
+    out.push_str("\n## 原始需求\n（见本回合第一条用户消息，必须继续以其为准。）");
+    out
+}
+
+/// 验证者子任务 → orchestrator 的完成通知（不经过 AgentMessage 链路）。
+struct VerificationEvent {
+    parent_session_id: String,
+    turn_id: u64,
+    report: VerificationReport,
+}
 
 /// 排队等待执行的 subagent spawn 请求（保存 spawn_sub_agent 的全部参数）
 struct QueuedSpawn {
@@ -182,6 +255,17 @@ pub struct Orchestrator {
     /// 同回合最近一次 `UsageInfo`（input_tokens, output_tokens, tool_calls），
     /// 供会话级 `Stop` 载荷取值（设计 §6.2）。
     latest_usage: HashMap<String, (u64, u64, u64)>,
+    /// 根回合 → 独立验证状态。
+    turn_states: HashMap<String, TurnVerificationState>,
+    /// 工具调用 id → (工具名, 参数 JSON)，用于在成功结果到达时判断是否修改文件。
+    pending_tool_calls: HashMap<String, (String, String)>,
+    /// 独立验证配置；`Orchestrator::new` 默认关闭，daemon 装配时按 `[verifier]` 开启。
+    verifier_config: VerifierConfig,
+    /// 验证者完成通知通道（避免验证任务与 orchestrator 主循环耦合）。
+    verification_tx: mpsc::Sender<VerificationEvent>,
+    verification_rx: mpsc::Receiver<VerificationEvent>,
+    /// 根回合代号分配器。
+    next_turn_id: u64,
 
     // ── 共享依赖 ─────────────────────────────────────────────
     session_mgr: Arc<SessionManager>,
@@ -212,6 +296,7 @@ impl Orchestrator {
         providers: HashMap<String, Arc<dyn LlmProvider>>,
         bus: Arc<dyn EventPublisher>,
     ) -> Self {
+        let (verification_tx, verification_rx) = mpsc::channel(32);
         Self {
             cancel_rx,
             global_rx,
@@ -225,6 +310,12 @@ impl Orchestrator {
             queued_spawns: std::collections::VecDeque::new(),
             session_sources: HashMap::new(),
             latest_usage: HashMap::new(),
+            turn_states: HashMap::new(),
+            pending_tool_calls: HashMap::new(),
+            verifier_config: VerifierConfig::disabled(),
+            verification_tx,
+            verification_rx,
+            next_turn_id: 1,
             session_mgr,
             agent_registry,
             tool_registry,
@@ -234,6 +325,12 @@ impl Orchestrator {
             daemon_config,
             providers,
         }
+    }
+
+    /// 配置独立验证行为（daemon 装配时调用；测试可显式启用）。
+    pub fn with_verifier_config(mut self, config: VerifierConfig) -> Self {
+        self.verifier_config = config;
+        self
     }
 
     // ── 主循环 ───────────────────────────────────────────────
@@ -256,6 +353,9 @@ impl Orchestrator {
                 }
                 Some(msg) = self.grpc_rx.recv() => {
                     self.handle_client_message(msg).await;
+                }
+                Some(ev) = self.verification_rx.recv() => {
+                    self.handle_verification_complete(ev).await;
                 }
                 else => break,
             }
@@ -301,11 +401,26 @@ impl Orchestrator {
                 // 错误退出同样释放并发空位 → 消费队列
                 self.drain_queued_spawns().await;
             }
-            AgentMessage::ToolCallRequest { .. } => {
-                // ToolCallRequest 已由工具执行任务直接送达 CLI
+            AgentMessage::ToolCallRequest {
+                call_id,
+                tool_name,
+                arguments,
+            } => {
+                // ToolCallRequest 已由工具执行任务直接送达 CLI；这里额外记录
+                // 可能的写文件调用，供成功结果到达时统计「本回合改动了哪些文件」。
+                if is_mutating_tool(&tool_name) {
+                    self.pending_tool_calls
+                        .insert(call_id, (tool_name, arguments));
+                }
             }
-            AgentMessage::ToolCallResult { .. } => {
-                // ToolCallResult 已由工具执行任务直接送达 CLI
+            AgentMessage::ToolCallResult {
+                call_id,
+                tool_name,
+                is_error,
+                ..
+            } => {
+                // ToolCallResult 已由工具执行任务直接送达 CLI；这里只做验证判定。
+                self.record_tool_result(&session_id, &call_id, &tool_name, is_error);
             }
             AgentMessage::UserQuery {
                 query_id,
@@ -388,6 +503,24 @@ impl Orchestrator {
             ClientMessage::UserInput { session_id, text } => {
                 match self.session_mgr.get(&session_id) {
                     Ok(session) if session.parent_id.is_none() => {
+                        // 新用户回合：废弃上一回合仍在进行的验证（迟到的结果按 turn_id 丢弃）。
+                        self.abort_turn_verification(&session_id);
+                        let turn_id = self.next_turn_id;
+                        self.next_turn_id += 1;
+                        self.turn_states.insert(
+                            session_id.clone(),
+                            TurnVerificationState {
+                                turn_id,
+                                original_request: text.clone(),
+                                modified: false,
+                                changed_paths: BTreeSet::new(),
+                                rework_used: 0,
+                                verifier_session: None,
+                                cancel_token: CancellationToken::new(),
+                                cancelled: false,
+                                done_withheld: false,
+                            },
+                        );
                         // 恢复场景主 session 可能是 Completed/Error，重置为 Idle 再启动。
                         // 仅终态（Completed/Error）→ Idle；`Running` 不再重置——由 `start_loop`
                         // 的状态闸以 `SessionBusy` 拒绝，避免覆盖在途循环。
@@ -420,6 +553,10 @@ impl Orchestrator {
             }
             ClientMessage::Cancel { session_id } => {
                 tracing::info!(%session_id, "cancelling agent by user request");
+                // 标记回合已取消：即使验证者随后返回 failed，也不得再触发返工。
+                if let Some(state) = self.turn_states.get_mut(&session_id) {
+                    state.cancelled = true;
+                }
                 self.cancel_agent(&session_id);
             }
         }
@@ -429,6 +566,18 @@ impl Orchestrator {
 
     /// 启动主 Agent（根，无 parent）
     async fn start_main_agent(&mut self, session_id: &str, user_message: &str) {
+        self.start_main_agent_inner(session_id, user_message, false)
+            .await;
+    }
+
+    /// 启动主 Agent。`is_rework=true` 表示这是验证失败后的返工回合：
+    /// 不重复发 `UserPromptSubmit` hook，且不重置回合状态（原始需求保持不变）。
+    async fn start_main_agent_inner(
+        &mut self,
+        session_id: &str,
+        user_message: &str,
+        is_rework: bool,
+    ) {
         let (agent_name, is_main) = match self.session_mgr.get(session_id) {
             Ok(s) => (s.agent_name.clone(), s.parent_id.is_none()),
             Err(e) => {
@@ -598,7 +747,10 @@ impl Orchestrator {
             self.publish_session_start(session_id, &ctx, &agent_name);
         }
         // `UserPromptSubmit`：主 agent 受理 UserInput 且 start_loop 成功时发一次。
-        self.publish_user_prompt_submit(session_id, &ctx, user_message);
+        // 返工是内部生成的消息，不对应新的用户提交，故跳过。
+        if !is_rework {
+            self.publish_user_prompt_submit(session_id, &ctx, user_message);
+        }
 
         let mut msg = Message::user(&clean_text);
         msg.images = images;
@@ -610,6 +762,11 @@ impl Orchestrator {
         let agent_name = agent_name.clone();
         tokio::spawn(async move {
             while let Some(event) = agent_rx.recv().await {
+                // 根回合的 Done 由 orchestrator 在「独立验证收尾」后统一发布：
+                // 若直接转发，ACP/headless 会在验证完成前就结束 turn。
+                if matches!(event, AgentEvent::Done) {
+                    continue;
+                }
                 let frame = AgentEventFrame {
                     event,
                     session_id: sid.clone(),
@@ -1007,6 +1164,339 @@ impl Orchestrator {
         );
     }
 
+    // ── 独立验证 ─────────────────────────────────────────────
+
+    /// 记录一次工具结果：成功的写文件调用标记本回合「改动了项目文件」。
+    ///
+    /// 子 agent（如 fixer）的写文件也归到根回合：沿 parent 链上溯。
+    fn record_tool_result(
+        &mut self,
+        session_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        is_error: bool,
+    ) {
+        let pending = self.pending_tool_calls.remove(call_id);
+        if is_error {
+            return;
+        }
+        // 以 ToolCallRequest 记录的工具名为准（Result 的 tool_name 可能为空）。
+        let name = pending
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| tool_name.to_string());
+        if !is_mutating_tool(&name) {
+            return;
+        }
+        let root = root_ancestor(&self.active_agents, session_id);
+        let Some(state) = self.turn_states.get_mut(&root) else {
+            return;
+        };
+        state.modified = true;
+        if let Some((_, args)) = pending
+            && let Some(path) = extract_changed_path(&args)
+        {
+            state.changed_paths.insert(path);
+        }
+    }
+
+    /// 放弃某根会话正在进行的验证（新用户回合/显式取消时调用）。
+    fn abort_turn_verification(&mut self, root_session_id: &str) {
+        if let Some(state) = self.turn_states.remove(root_session_id) {
+            state.cancel_token.cancel();
+            if let Some(verifier_session) = state.verifier_session {
+                self.active_agents.remove(&verifier_session);
+                self.session_mgr.cancel_agent(&verifier_session);
+            }
+        }
+    }
+
+    /// 解析验证者使用的 provider 与 LlmConfig。
+    ///
+    /// `verifier.model` 是 `{provider}/{name}` 形式的模型 key；未配置时继承主会话。
+    /// 行为完全由显式配置决定，不根据模型名称做任何判断。
+    fn verifier_provider(
+        &self,
+        root_session_id: &str,
+    ) -> Option<(Arc<dyn LlmProvider>, LlmConfig)> {
+        let session = self.session_mgr.get(root_session_id).ok()?;
+        let mut config = session.config.clone();
+        let key = visp_config::resolve_model_key(
+            self.verifier_config.model.as_deref(),
+            &session.config,
+            &self.daemon_config,
+        );
+        if self.verifier_config.model.is_some()
+            && let Some(model_cfg) = visp_config::resolve_model(&key, &self.daemon_config)
+        {
+            visp_config::apply_model_override(&mut config, &model_cfg);
+        }
+        config.model_key = Some(key.clone());
+        self.providers.get(&key).cloned().map(|p| (p, config))
+    }
+
+    /// 发布一条验证事件（归属根会话，所有入口都在主对话流中可见）。
+    fn publish_verification(&self, session_id: &str, agent_name: &str, update: VerificationUpdate) {
+        self.bus.publish(BusEvent::Frame(AgentEventFrame {
+            event: AgentEvent::Verification(update),
+            session_id: session_id.to_string(),
+            agent_name: agent_name.to_string(),
+            parent_session_id: None,
+            parent_session_name: None,
+        }));
+    }
+
+    /// 启动一轮独立验证（异步入子会话运行，结果经 `verification_tx` 回到主循环）。
+    async fn start_verification(&mut self, root_session_id: &str) {
+        let Some(state) = self.turn_states.get_mut(root_session_id) else {
+            return;
+        };
+        let turn_id = state.turn_id;
+        let round = state.rework_used + 1;
+        let max_rounds = self.verifier_config.max_rounds;
+        let original_request = state.original_request.clone();
+        let changed_paths: Vec<String> = state.changed_paths.iter().cloned().collect();
+        state.done_withheld = true;
+        let cancel_token = state.cancel_token.clone();
+
+        let agent_name = self
+            .active_agents
+            .get(root_session_id)
+            .map(|a| a.agent_name.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        self.publish_verification(
+            root_session_id,
+            &agent_name,
+            VerificationUpdate::started(round, max_rounds),
+        );
+
+        let (provider, base_config) = match self.verifier_provider(root_session_id) {
+            Some(p) => p,
+            None => {
+                let update = VerificationUpdate::inconclusive(
+                    round,
+                    max_rounds,
+                    "无法解析验证者模型（请检查 [verifier].model 与 [[llm.models]]）",
+                    Vec::new(),
+                );
+                self.end_root_turn(root_session_id, &agent_name, Some(update));
+                return;
+            }
+        };
+
+        let session = match self.session_mgr.get(root_session_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(root_session_id, error = %e, "verification: root session missing");
+                let update = VerificationUpdate::inconclusive(
+                    round,
+                    max_rounds,
+                    format!("无法读取根会话: {e}"),
+                    Vec::new(),
+                );
+                self.end_root_turn(root_session_id, &agent_name, Some(update));
+                return;
+            }
+        };
+
+        let verifier_session_id = uuid::Uuid::new_v4().to_string();
+        if let Some(state) = self.turn_states.get_mut(root_session_id) {
+            state.verifier_session = Some(verifier_session_id.clone());
+        }
+
+        // 登记为根会话的子 agent：这样用户 Cancel 根会话时能级联取消验证。
+        let (inbox_tx, _inbox_rx) = mpsc::channel(8);
+        self.active_agents.register(ActiveAgent {
+            session_id: verifier_session_id.clone(),
+            parent_session_id: Some(root_session_id.to_string()),
+            agent_name: VERIFIER_AGENT_NAME.to_string(),
+            cancel_token: cancel_token.clone(),
+            inbox: inbox_tx,
+            pending_call_id: None,
+            started_at: std::time::Instant::now(),
+        });
+
+        let request = VerifierRunRequest {
+            parent_session_id: root_session_id.to_string(),
+            session_id: verifier_session_id,
+            original_request,
+            changed_paths,
+            project_path: session.project_path.clone(),
+            base_config,
+            approved_tools: session.approved_tools.clone(),
+        };
+        let config = self.verifier_config.clone();
+        let tool_registry = self.tool_registry.clone();
+        let rule_engine = self.rule_engine.clone();
+        let session_mgr = self.session_mgr.clone();
+        let context_trimmer = self.context_trimmer.clone();
+        let bus = self.bus.clone();
+        let tx = self.verification_tx.clone();
+        let root = root_session_id.to_string();
+
+        tokio::spawn(async move {
+            let report = run_verifier(
+                provider,
+                tool_registry,
+                rule_engine,
+                session_mgr,
+                context_trimmer,
+                bus,
+                config,
+                request,
+            )
+            .await;
+            let _ = tx
+                .send(VerificationEvent {
+                    parent_session_id: root,
+                    turn_id,
+                    report,
+                })
+                .await;
+        });
+    }
+
+    /// 处理验证者返回的结论：通过则收尾；失败则（在预算内）交回主 agent 返工。
+    async fn handle_verification_complete(&mut self, ev: VerificationEvent) {
+        let Some(state) = self.turn_states.get(&ev.parent_session_id) else {
+            return; // 新回合已废弃本回合状态
+        };
+        if state.turn_id != ev.turn_id {
+            tracing::info!(
+                session = %ev.parent_session_id,
+                stale_turn = ev.turn_id,
+                "ignoring stale verification result"
+            );
+            return;
+        }
+        let rework_used = state.rework_used;
+        let cancelled = state.cancelled;
+        if let Some(verifier_session) = state.verifier_session.clone() {
+            self.active_agents.remove(&verifier_session);
+            self.sub_agent_handles.remove(&verifier_session);
+        }
+        let root = ev.parent_session_id.clone();
+        let agent_name = self
+            .active_agents
+            .get(&root)
+            .map(|a| a.agent_name.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let round = rework_used + 1;
+        let max_rounds = self.verifier_config.max_rounds;
+        let report = ev.report;
+
+        if report.passed {
+            let update =
+                VerificationUpdate::passed(round, max_rounds, report.summary, report.evidence);
+            self.end_root_turn(&root, &agent_name, Some(update));
+            return;
+        }
+
+        if cancelled {
+            let update = VerificationUpdate::failed(
+                round,
+                max_rounds,
+                "用户已取消，验证未完成",
+                report.evidence,
+                true,
+            );
+            self.end_root_turn(&root, &agent_name, Some(update));
+            return;
+        }
+
+        // 「验证没做成」与「验证发现缺陷」必须分开处理：
+        // 后者返工，前者不返工（主 agent 没有可修正的具体问题），但仍判失败。
+        if !report.completed {
+            let update = VerificationUpdate::inconclusive(
+                round,
+                max_rounds,
+                report.summary,
+                report.evidence,
+            );
+            self.end_root_turn(&root, &agent_name, Some(update));
+            return;
+        }
+
+        if rework_used < max_rounds {
+            self.publish_verification(
+                &root,
+                &agent_name,
+                VerificationUpdate::failed(
+                    round,
+                    max_rounds,
+                    report.summary.clone(),
+                    report.evidence.clone(),
+                    false,
+                ),
+            );
+            if let Some(state) = self.turn_states.get_mut(&root) {
+                state.rework_used += 1;
+                state.verifier_session = None;
+                state.done_withheld = true;
+            }
+            self.publish_verification(
+                &root,
+                &agent_name,
+                VerificationUpdate::rework(
+                    round + 1,
+                    max_rounds,
+                    format!(
+                        "验证未通过，交回主 agent 返工（第 {}/{} 轮）",
+                        round, max_rounds
+                    ),
+                ),
+            );
+            let prompt = build_rework_prompt(&report);
+            self.start_main_agent_inner(&root, &prompt, true).await;
+            return;
+        }
+
+        let update =
+            VerificationUpdate::exhausted(round, max_rounds, report.summary, report.evidence);
+        self.end_root_turn(&root, &agent_name, Some(update));
+    }
+
+    /// 正常结束根回合：清理状态、发布（可选）最终验证结论、root Done 与 Stop hook。
+    fn end_root_turn(
+        &mut self,
+        session_id: &str,
+        agent_name: &str,
+        final_update: Option<VerificationUpdate>,
+    ) {
+        if let Some(state) = self.turn_states.remove(session_id)
+            && let Some(verifier_session) = state.verifier_session
+        {
+            self.active_agents.remove(&verifier_session);
+            self.sub_agent_handles.remove(&verifier_session);
+        }
+        self.active_agents.remove(session_id);
+        self.sub_agent_handles.remove(session_id);
+        let _ = self
+            .session_mgr
+            .finish_loop(session_id, SessionStatus::Idle);
+
+        if let Some(update) = final_update {
+            self.publish_verification(session_id, agent_name, update);
+        }
+        self.bus.publish(BusEvent::Frame(AgentEventFrame {
+            event: AgentEvent::Done,
+            session_id: session_id.to_string(),
+            agent_name: agent_name.to_string(),
+            parent_session_id: None,
+            parent_session_name: None,
+        }));
+        let (input_tokens, output_tokens, tool_calls) =
+            self.latest_usage.remove(session_id).unwrap_or((0, 0, 0));
+        self.publish_stop(
+            session_id,
+            StopStatus::Completed,
+            input_tokens,
+            output_tokens,
+            tool_calls,
+        );
+    }
+
     /// 处理 Agent 完成
     async fn handle_done(&mut self, session_id: &str) {
         let agent_info = match self.active_agents.get(session_id) {
@@ -1041,11 +1531,30 @@ impl Orchestrator {
             return;
         }
 
-        // Remove from registry
+        // ── 根回合：先判断是否需要独立验证 ────────────────────────
+        if parent_id.is_none() {
+            let should_verify = self.verifier_config.enabled
+                && self
+                    .turn_states
+                    .get(session_id)
+                    .is_some_and(|s| s.modified && !s.cancelled);
+            if should_verify {
+                // 释放会话状态闸（返工需要再次 start_loop），但保留 ActiveAgent 以
+                // 便取消信号能级联到验证者子会话；root Done 暂不发出。
+                let _ = self
+                    .session_mgr
+                    .finish_loop(session_id, SessionStatus::Idle);
+                self.start_verification(session_id).await;
+                return;
+            }
+            // 未触发验证：正常收尾（Done + Stop 由本函数统一发布）。
+            self.end_root_turn(session_id, &agent_name, None);
+            return;
+        }
+
+        // ── 子 Agent：原路径 ──────────────────────────────────────
         self.active_agents.remove(session_id);
         self.sub_agent_handles.remove(session_id);
-
-        // Finish the session
         let _ = self
             .session_mgr
             .finish_loop(session_id, SessionStatus::Idle);
@@ -1057,67 +1566,49 @@ impl Orchestrator {
             return;
         }
 
-        // Send result to parent if this is a sub-agent
-        if let Some(ref parent_id) = parent_id {
-            let content = self.extract_result(session_id);
-            let call_id = pending_call_id.unwrap_or_default();
+        let content = self.extract_result(session_id);
+        let call_id = pending_call_id.unwrap_or_default();
 
-            if let Some(parent) = self.active_agents.get(parent_id) {
-                match parent
-                    .inbox
-                    .try_send(OrchestratorMessage::SubAgentComplete {
-                        call_id,
-                        content,
-                        task_id: String::new(),
-                    }) {
-                    Ok(()) => {
-                        tracing::info!(
-                            session_id,
-                            parent_id,
-                            agent_name,
-                            "sub-agent completion forwarded to parent"
-                        );
-                    }
-                    Err(mpsc::error::TrySendError::Full(msg)) => {
-                        let inbox = parent.inbox.clone();
-                        let log_session_id = session_id.to_string();
-                        let log_parent_id = parent_id.clone();
-                        let log_agent_name = agent_name.clone();
-                        tokio::spawn(async move {
-                            let _ = inbox.send(msg).await;
-                            tracing::info!(
-                                session_id = %log_session_id,
-                                parent_id = %log_parent_id,
-                                agent_name = %log_agent_name,
-                                "sub-agent completion forwarded to parent (after backpressure)"
-                            );
-                        });
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::warn!(parent_id, "parent agent inbox closed, sub result dropped");
-                    }
+        if let Some(parent) = self
+            .active_agents
+            .get(parent_id.as_deref().unwrap_or_default())
+        {
+            match parent
+                .inbox
+                .try_send(OrchestratorMessage::SubAgentComplete {
+                    call_id,
+                    content,
+                    task_id: String::new(),
+                }) {
+                Ok(()) => {
+                    tracing::info!(
+                        session_id,
+                        parent_id = ?parent_id,
+                        agent_name,
+                        "sub-agent completion forwarded to parent"
+                    );
                 }
-            } else {
-                tracing::warn!(
-                    parent_id,
-                    "parent agent no longer active, sub result dropped"
-                );
+                Err(mpsc::error::TrySendError::Full(msg)) => {
+                    let inbox = parent.inbox.clone();
+                    let log_session_id = session_id.to_string();
+                    let log_parent_id = parent_id.clone();
+                    let log_agent_name = agent_name.clone();
+                    tokio::spawn(async move {
+                        let _ = inbox.send(msg).await;
+                        tracing::info!(
+                            session_id = %log_session_id,
+                            parent_id = ?log_parent_id,
+                            agent_name = %log_agent_name,
+                            "sub-agent completion forwarded to parent (after backpressure)"
+                        );
+                    });
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("parent agent inbox closed, sub result dropped");
+                }
             }
         } else {
-            // Root agent done — 会话级 `Stop`（设计 §6.2：清理置 Idle 之后）。
-            //
-            // 不再补发 root `Done` 帧：主 agent 的 `Done` 帧由 `agent_loop` →
-            // 主转发任务 → 总线独立送达 TUI（并派生执行级 `AgentRunEnd`），
-            // 此处再发会造成根回合重复的 `Done` 帧。
-            let (input_tokens, output_tokens, tool_calls) =
-                self.latest_usage.remove(session_id).unwrap_or((0, 0, 0));
-            self.publish_stop(
-                session_id,
-                StopStatus::Completed,
-                input_tokens,
-                output_tokens,
-                tool_calls,
-            );
+            tracing::warn!("parent agent no longer active, sub result dropped");
         }
     }
 
@@ -1190,6 +1681,62 @@ impl Orchestrator {
             return;
         }
 
+        // 根回合处于「等待验证/返工」窗口时，错误意味着本回合无法正常收尾：
+        // 必须显式给出最终验证失败结论并补发 root Done，否则客户端会永远停在运行态。
+        if parent_id.is_none()
+            && self
+                .turn_states
+                .get(session_id)
+                .is_some_and(|s| s.done_withheld)
+        {
+            let state = self.turn_states.remove(session_id);
+            let (round, verifier_session) = state
+                .as_ref()
+                .map(|s| (s.rework_used + 1, s.verifier_session.clone()))
+                .unwrap_or((1, None));
+            if let Some(verifier_session) = verifier_session {
+                self.active_agents.remove(&verifier_session);
+                self.session_mgr.cancel_agent(&verifier_session);
+            }
+            let max_rounds = self.verifier_config.max_rounds;
+            self.active_agents.remove(session_id);
+            self.sub_agent_handles.remove(session_id);
+            let _ = self
+                .session_mgr
+                .finish_loop(session_id, SessionStatus::Idle);
+            let summary = if is_cancel {
+                "用户已取消，验证未完成".to_string()
+            } else {
+                format!("返工回合执行失败：{normalized_message}")
+            };
+            self.publish_verification(
+                session_id,
+                &agent_name,
+                VerificationUpdate::failed(round, max_rounds, summary, Vec::new(), true),
+            );
+            self.bus.publish(BusEvent::Frame(AgentEventFrame {
+                event: AgentEvent::Done,
+                session_id: session_id.to_string(),
+                agent_name: agent_name.clone(),
+                parent_session_id: None,
+                parent_session_name: None,
+            }));
+            let (input_tokens, output_tokens, tool_calls) =
+                self.latest_usage.remove(session_id).unwrap_or((0, 0, 0));
+            if is_cancel {
+                self.publish_stop(
+                    session_id,
+                    StopStatus::Cancelled,
+                    input_tokens,
+                    output_tokens,
+                    tool_calls,
+                );
+            } else {
+                self.publish_stop_failure(session_id, &format!("{code:?}"), &normalized_message);
+            }
+            return;
+        }
+
         self.active_agents.remove(session_id);
         self.sub_agent_handles.remove(session_id);
         let _ = self
@@ -1213,6 +1760,7 @@ impl Orchestrator {
                 "sub-agent error forwarded to parent as SubAgentError"
             );
         } else if is_cancel {
+            self.turn_states.remove(session_id);
             tracing::info!(session_id, agent_name, "root agent cancelled by user");
             // 用户取消：会话级 `Stop(status=cancelled)`，**不**误入 `StopFailure`
             // （设计 §6.2：#18）。
@@ -1226,6 +1774,7 @@ impl Orchestrator {
                 tool_calls,
             );
         } else {
+            self.turn_states.remove(session_id);
             // Root agent error — Error 帧仍由 run_agent_loop 直送 CLI；
             // 会话级 `StopFailure`（设计 §6.2：语义收敛后，含 code/message）。
             tracing::error!(

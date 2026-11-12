@@ -12,8 +12,18 @@
 //! - Questions with options from the model get a fixed "no user available"
 //!   answer so the loop never blocks.
 //!
-//! Exit codes: 0 = the main agent finished (`Done`); 1 = the main agent ended
-//! with an error; 3 = the daemon stream closed unexpectedly; 130 = interrupted.
+//! Exit codes (each value has exactly one meaning):
+//! - 0: the main agent finished and verification passed (or was not triggered)
+//! - 1: the main agent (or the launcher) hit a runtime error
+//! - 2: command-line usage error (clap's own exit code for parse failures,
+//!   also used for unsupported flag combinations and a missing prompt). `run`
+//!   results never reuse it, so scripts can tell a bad command from a verdict.
+//! - 3: the daemon stream closed unexpectedly
+//! - 4: the main agent finished but the verifier could not complete verification
+//!   (timeout, step limit, no structured conclusion). This is **not** a pass and
+//!   is distinct from 5: no code defect was found.
+//! - 5: the main agent finished but independent verification rejected the result
+//! - 130: interrupted
 
 use std::future::Future;
 use std::io::Write;
@@ -30,6 +40,24 @@ Decide yourself using your best judgement, state the assumption you made, and co
 /// How long to wait for the daemon to acknowledge a cancel after Ctrl-C.
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Exit codes of `visp run`. Each value has exactly one meaning. `EXIT_USAGE`
+/// is also what clap returns when the command line cannot be parsed (that
+/// happens before `run_once`), so no `RunOutcome` may use it.
+pub const EXIT_OK: i32 = 0;
+/// The main agent (or the launcher around it) hit a runtime error.
+pub const EXIT_AGENT_ERROR: i32 = 1;
+/// Command-line usage error: clap parse failure, unsupported flag
+/// combination, or a missing prompt.
+pub const EXIT_USAGE: i32 = 2;
+/// The daemon's chat stream closed before the turn finished.
+pub const EXIT_STREAM_CLOSED: i32 = 3;
+/// The main agent finished but the verifier could not complete verification.
+pub const EXIT_VERIFICATION_INCOMPLETE: i32 = 4;
+/// The main agent finished but independent verification rejected the result.
+pub const EXIT_VERIFICATION_FAILED: i32 = 5;
+/// Interrupted by the user (Ctrl-C).
+pub const EXIT_INTERRUPTED: i32 = 130;
+
 /// Selected index for a tool approval (`UserQuery` with no options).
 /// Same mapping as the TUI / visp-acp: 0 = allow once, 1 = deny.
 const APPROVE_ONCE: i32 = 0;
@@ -40,6 +68,11 @@ const DENY: i32 = 1;
 pub enum RunOutcome {
     /// The main agent finished its turn.
     Completed,
+    /// The agent finished, but the independent verifier found defects.
+    VerificationFailed { summary: String },
+    /// The agent finished, but verification did not complete (not a pass, and
+    /// not a defect verdict either).
+    VerificationIncomplete { summary: String },
     /// The main agent ended with an error.
     AgentError { code: String, message: String },
     /// The daemon's chat stream closed before the turn finished.
@@ -51,12 +84,22 @@ pub enum RunOutcome {
 impl RunOutcome {
     pub fn exit_code(&self) -> i32 {
         match self {
-            RunOutcome::Completed => 0,
-            RunOutcome::AgentError { .. } => 1,
-            RunOutcome::StreamClosed => 3,
-            RunOutcome::Interrupted => 130,
+            RunOutcome::Completed => EXIT_OK,
+            RunOutcome::AgentError { .. } => EXIT_AGENT_ERROR,
+            RunOutcome::VerificationFailed { .. } => EXIT_VERIFICATION_FAILED,
+            RunOutcome::StreamClosed => EXIT_STREAM_CLOSED,
+            RunOutcome::VerificationIncomplete { .. } => EXIT_VERIFICATION_INCOMPLETE,
+            RunOutcome::Interrupted => EXIT_INTERRUPTED,
         }
     }
+}
+
+/// Final verification state observed before the root `Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationState {
+    Passed,
+    Failed,
+    Incomplete,
 }
 
 /// Totals printed at the end (stderr).
@@ -131,6 +174,7 @@ pub async fn drive<O: Write, E: Write>(
     let mut interrupted = false;
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let mut text_open = false;
+    let mut verification: Option<(VerificationState, String)> = None;
 
     loop {
         let msg = tokio::select! {
@@ -223,6 +267,19 @@ pub async fn drive<O: Write, E: Write>(
                     return RunOutcome::StreamClosed;
                 }
             }
+            server_message::Payload::VerificationUpdate(v) => {
+                for line in format_verification_lines(&v) {
+                    let _ = writeln!(err, "{line}");
+                }
+                if v.is_final {
+                    let state = match v.stage.as_str() {
+                        "passed" => VerificationState::Passed,
+                        "inconclusive" => VerificationState::Incomplete,
+                        _ => VerificationState::Failed,
+                    };
+                    verification = Some((state, v.summary.clone()));
+                }
+            }
             server_message::Payload::StatusUpdate(su) => {
                 if su.session_id == session_id && !su.message.is_empty() {
                     let _ = writeln!(err, "[status] {}", one_line(&su.message, 200));
@@ -238,10 +295,17 @@ pub async fn drive<O: Write, E: Write>(
                     if text_open {
                         let _ = writeln!(out);
                     }
-                    return if interrupted {
-                        RunOutcome::Interrupted
-                    } else {
-                        RunOutcome::Completed
+                    if interrupted {
+                        return RunOutcome::Interrupted;
+                    }
+                    return match verification {
+                        Some((VerificationState::Failed, summary)) => {
+                            RunOutcome::VerificationFailed { summary }
+                        }
+                        Some((VerificationState::Incomplete, summary)) => {
+                            RunOutcome::VerificationIncomplete { summary }
+                        }
+                        Some((VerificationState::Passed, _)) | None => RunOutcome::Completed,
                     };
                 }
             }
@@ -260,6 +324,42 @@ pub async fn drive<O: Write, E: Write>(
             _ => {}
         }
     }
+}
+
+/// Render a structured verification event for stderr.
+pub fn format_verification_lines(v: &visp_proto::visp::VerificationUpdate) -> Vec<String> {
+    let head = match v.stage.as_str() {
+        "started" => format!(
+            "[verify] 🔍 第 {} 轮独立验证开始（返工上限 {}）",
+            v.round, v.max_rounds
+        ),
+        "passed" => format!("[verify] ✅ 验证通过：{}", v.summary),
+        "failed" => {
+            if v.is_final {
+                format!("[verify] ❌ 验证未通过：{}", v.summary)
+            } else {
+                format!("[verify] ❌ 验证未通过（将继续返工）：{}", v.summary)
+            }
+        }
+        "rework" => format!("[verify] ↩ {}", v.summary),
+        "exhausted" => format!(
+            "[verify] ❌ 验证未通过（已用尽 {} 轮返工）：{}",
+            v.max_rounds, v.summary
+        ),
+        "inconclusive" => format!(
+            "[verify] ⚠️ 验证未完成（验证没做成，不是发现缺陷）：{}",
+            v.summary
+        ),
+        other => format!("[verify] {}: {}", other, v.summary),
+    };
+    let mut lines = vec![head];
+    for ev in &v.evidence {
+        lines.push(format!(
+            "[verify]   证据：检查={}；方法={}；结果={}",
+            ev.check, ev.method, ev.result
+        ));
+    }
+    lines
 }
 
 /// Read the prompt: positional words joined by spaces, or stdin when the
@@ -531,5 +631,173 @@ mod tests {
             "piped"
         );
         assert!(resolve_prompt(&[], "   ".as_bytes()).is_err());
+    }
+
+    fn verification(stage: &str, is_final: bool, passed: bool, summary: &str) -> ServerMessage {
+        msg(server_message::Payload::VerificationUpdate(
+            visp_proto::visp::VerificationUpdate {
+                stage: stage.into(),
+                round: 1,
+                max_rounds: 2,
+                summary: summary.into(),
+                evidence: vec![visp_proto::visp::VerificationEvidence {
+                    check: "10 万行 CSV 按列名查询".into(),
+                    method: "构造大文件并实际运行".into(),
+                    result: "失败：仍全量加载".into(),
+                }],
+                is_final,
+                passed,
+                session_id: "parent".into(),
+                agent_name: "verifier".into(),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn final_failed_verification_maps_to_exit_code_2() {
+        let (outcome, _out, err, _, _) = run(
+            vec![
+                verification("started", false, false, "进行中"),
+                text("parent", "", "初版完成"),
+                verification("exhausted", true, false, "核心场景仍不满足"),
+                done("parent"),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            RunOutcome::VerificationFailed {
+                summary: "核心场景仍不满足".into()
+            }
+        );
+        assert_eq!(
+            outcome.exit_code(),
+            EXIT_VERIFICATION_FAILED,
+            "验证发现缺陷必须单独退出码"
+        );
+        assert!(err.contains("验证未通过"));
+        assert!(err.contains("10 万行 CSV 按列名查询"), "stderr 必须带证据");
+    }
+
+    #[tokio::test]
+    async fn incomplete_verification_is_not_a_pass_and_has_its_own_exit_code() {
+        let (outcome, _out, err, _, _) = run(
+            vec![
+                verification(
+                    "inconclusive",
+                    true,
+                    false,
+                    "验证者未提交结构化结论（步数用尽）",
+                ),
+                done("parent"),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            RunOutcome::VerificationIncomplete {
+                summary: "验证者未提交结构化结论（步数用尽）".into()
+            }
+        );
+        assert_eq!(
+            outcome.exit_code(),
+            4,
+            "验证没做成既不是成功，也不应与发现缺陷共用退出码"
+        );
+        assert!(err.contains("验证未完成"));
+        assert!(err.contains("不是发现缺陷"));
+    }
+
+    #[tokio::test]
+    async fn passed_verification_keeps_exit_code_0() {
+        let (outcome, out, _, _, _) = run(
+            vec![
+                text("parent", "", "答案"),
+                verification("passed", true, true, "核心场景通过"),
+                done("parent"),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(outcome.exit_code(), 0);
+        assert_eq!(out, "答案\n");
+    }
+
+    /// Each exit code must have exactly one meaning. In particular 2 is what
+    /// clap returns for a bad command line (outside `run_once`), so no
+    /// `RunOutcome` may reuse it.
+    #[test]
+    fn exit_codes_are_unique_and_keep_2_for_cli_usage_errors() {
+        let cases = [
+            ("completed", RunOutcome::Completed.exit_code(), EXIT_OK),
+            (
+                "agent error",
+                RunOutcome::AgentError {
+                    code: "LlmApi".into(),
+                    message: "boom".into(),
+                }
+                .exit_code(),
+                EXIT_AGENT_ERROR,
+            ),
+            (
+                "verification failed",
+                RunOutcome::VerificationFailed {
+                    summary: "缺陷".into(),
+                }
+                .exit_code(),
+                EXIT_VERIFICATION_FAILED,
+            ),
+            (
+                "stream closed",
+                RunOutcome::StreamClosed.exit_code(),
+                EXIT_STREAM_CLOSED,
+            ),
+            (
+                "verification incomplete",
+                RunOutcome::VerificationIncomplete {
+                    summary: "没做成".into(),
+                }
+                .exit_code(),
+                EXIT_VERIFICATION_INCOMPLETE,
+            ),
+            (
+                "interrupted",
+                RunOutcome::Interrupted.exit_code(),
+                EXIT_INTERRUPTED,
+            ),
+        ];
+        for (name, got, want) in cases {
+            assert_eq!(got, want, "{name} 的退出码被改变了");
+        }
+
+        let mut codes: Vec<i32> = cases.iter().map(|(_, got, _)| *got).collect();
+        codes.push(EXIT_USAGE);
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            total,
+            "每个退出码只能有一种含义，实际: {codes:?}"
+        );
+        assert_eq!(
+            EXIT_VERIFICATION_FAILED, 5,
+            "2 留给 clap 的用法错误，验证失败必须用别的值"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_approval_is_granted_with_yes_for_verifier_commands() {
+        // 验证者作为子会话运行；--yes 必须同时放行它的命令审批。
+        let (_, _, _, sent, stats) = run(
+            vec![approval("verifier-session", "q1"), done("parent")],
+            true,
+        )
+        .await;
+        assert_eq!(selected(&sent[0]).0, APPROVE_ONCE);
+        assert_eq!(stats.approvals_granted, 1);
     }
 }

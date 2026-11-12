@@ -126,6 +126,7 @@ pub fn extract_session_id(msg: &ServerMessage) -> Option<&str> {
         server_message::Payload::UsageDelta(m) => Some(&m.session_id),
         server_message::Payload::ImageBlock(m) => Some(&m.session_id),
         server_message::Payload::ImageError(m) => Some(&m.session_id),
+        server_message::Payload::VerificationUpdate(m) => Some(&m.session_id),
     }
 }
 

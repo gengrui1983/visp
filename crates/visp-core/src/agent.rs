@@ -75,6 +75,152 @@ impl ToolOutcome {
     }
 }
 
+/// 验证阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStage {
+    /// 验证者已启动（每轮一次）
+    Started,
+    /// 本轮验证通过（is_final=true）
+    Passed,
+    /// 本轮验证未通过（is_final 表示是否已用尽返工轮数）
+    Failed,
+    /// 验证失败后交回主 agent 返工
+    Rework,
+    /// 返工轮数用尽，最终仍未通过
+    Exhausted,
+    /// 验证者未能完成验证并给出结论（超时、步数用尽、未提交结论等）。
+    ///
+    /// 与 `Failed` 的区别：`Failed` 表示验证者完成了验证并发现了缺陷；
+    /// `Inconclusive` 表示验证本身没做成。二者都**不得**视为通过，但前者触发返工，
+    /// 后者不触发返工（交回主 agent 修改没有依据）。
+    Inconclusive,
+}
+
+/// 一条验证证据：检查了什么、怎么检查、看到的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationEvidence {
+    pub check: String,
+    pub method: String,
+    pub result: String,
+}
+
+/// 独立验证的对外事件载荷。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationUpdate {
+    pub stage: VerificationStage,
+    /// 当前验证轮次（从 1 开始）
+    pub round: u32,
+    /// 允许的最大返工轮数（配置原值）
+    pub max_rounds: u32,
+    pub summary: String,
+    pub evidence: Vec<VerificationEvidence>,
+    /// 是否为最终结论（Passed/Failed-最终/Exhausted/Inconclusive 为 true）
+    pub is_final: bool,
+    /// 最终通过与否；非最终事件为 None
+    pub passed: Option<bool>,
+}
+
+impl VerificationUpdate {
+    /// 验证者已启动（非最终事件）。
+    pub fn started(round: u32, max_rounds: u32) -> Self {
+        Self {
+            stage: VerificationStage::Started,
+            round,
+            max_rounds,
+            summary: format!("独立验证进行中（第 {round} 轮）"),
+            evidence: Vec::new(),
+            is_final: false,
+            passed: None,
+        }
+    }
+
+    /// 本轮验证通过（最终结论）。
+    pub fn passed(
+        round: u32,
+        max_rounds: u32,
+        summary: impl Into<String>,
+        evidence: Vec<VerificationEvidence>,
+    ) -> Self {
+        Self {
+            stage: VerificationStage::Passed,
+            round,
+            max_rounds,
+            summary: summary.into(),
+            evidence,
+            is_final: true,
+            passed: Some(true),
+        }
+    }
+
+    /// 本轮验证未通过；`is_final` 表示是否已用尽返工轮数。
+    pub fn failed(
+        round: u32,
+        max_rounds: u32,
+        summary: impl Into<String>,
+        evidence: Vec<VerificationEvidence>,
+        is_final: bool,
+    ) -> Self {
+        Self {
+            stage: VerificationStage::Failed,
+            round,
+            max_rounds,
+            summary: summary.into(),
+            evidence,
+            is_final,
+            passed: Some(false),
+        }
+    }
+
+    /// 验证失败后交回主 agent 返工（非最终事件）。
+    pub fn rework(round: u32, max_rounds: u32, summary: impl Into<String>) -> Self {
+        Self {
+            stage: VerificationStage::Rework,
+            round,
+            max_rounds,
+            summary: summary.into(),
+            evidence: Vec::new(),
+            is_final: false,
+            passed: None,
+        }
+    }
+
+    /// 验证者未能完成验证（最终结论，passed=false）。
+    pub fn inconclusive(
+        round: u32,
+        max_rounds: u32,
+        summary: impl Into<String>,
+        evidence: Vec<VerificationEvidence>,
+    ) -> Self {
+        Self {
+            stage: VerificationStage::Inconclusive,
+            round,
+            max_rounds,
+            summary: summary.into(),
+            evidence,
+            is_final: true,
+            passed: Some(false),
+        }
+    }
+
+    /// 返工轮数用尽，最终仍未通过（最终结论）。
+    pub fn exhausted(
+        round: u32,
+        max_rounds: u32,
+        summary: impl Into<String>,
+        evidence: Vec<VerificationEvidence>,
+    ) -> Self {
+        Self {
+            stage: VerificationStage::Exhausted,
+            round,
+            max_rounds,
+            summary: summary.into(),
+            evidence,
+            is_final: true,
+            passed: Some(false),
+        }
+    }
+}
+
 /// Agent 事件，用于流式通知外部（TUI/WS）
 #[derive(Clone)]
 pub enum AgentEvent {
@@ -134,6 +280,8 @@ pub enum AgentEvent {
     },
     /// 状态更新
     StatusUpdate(String),
+    /// 独立验证进度/结论
+    Verification(VerificationUpdate),
     /// 发生错误
     Error {
         code: AgentErrorCode,
@@ -852,3 +1000,7 @@ pub(crate) fn dump_prompt_to_file(
 #[cfg(test)]
 #[path = "agent_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "verification_tests.rs"]
+mod verification_tests;

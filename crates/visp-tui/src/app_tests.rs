@@ -3626,3 +3626,103 @@ fn test_reconnect_cleanup_emits_subagent_closed_notice() {
         "应提示子 agent 标签页已关闭"
     );
 }
+
+// ── 独立验证展示 ──────────────────────────────────────────────
+
+fn verification_msg(
+    stage: &str,
+    round: u32,
+    is_final: bool,
+    passed: bool,
+) -> visp_proto::visp::ServerMessage {
+    use visp_proto::visp::server_message;
+    visp_proto::visp::ServerMessage {
+        payload: Some(server_message::Payload::VerificationUpdate(
+            visp_proto::visp::VerificationUpdate {
+                stage: stage.into(),
+                round,
+                max_rounds: 2,
+                summary: "核心场景：10 万行 CSV 按列名查询".into(),
+                evidence: vec![visp_proto::visp::VerificationEvidence {
+                    check: "10 万行查询".into(),
+                    method: "实际运行".into(),
+                    result: "通过".into(),
+                }],
+                is_final,
+                passed,
+                session_id: "sid".into(),
+                agent_name: "verifier".into(),
+            },
+        )),
+    }
+}
+
+#[test]
+fn verification_lines_show_progress_conclusion_and_evidence() {
+    let started = format_verification_lines(&match &verification_msg("started", 1, false, false)
+        .payload
+    {
+        Some(visp_proto::visp::server_message::Payload::VerificationUpdate(v)) => v.clone(),
+        _ => unreachable!(),
+    });
+    assert!(started[0].contains("独立验证"));
+    assert!(started[0].contains("第 1 轮"));
+
+    let passed =
+        format_verification_lines(&match &verification_msg("passed", 1, true, true).payload {
+            Some(visp_proto::visp::server_message::Payload::VerificationUpdate(v)) => v.clone(),
+            _ => unreachable!(),
+        });
+    assert!(passed[0].contains("验证通过"));
+    assert!(passed.iter().any(|l| l.contains("证据：")));
+    assert!(passed.iter().any(|l| l.contains("10 万行查询")));
+
+    let failed = format_verification_lines(&match &verification_msg("exhausted", 2, true, false)
+        .payload
+    {
+        Some(visp_proto::visp::server_message::Payload::VerificationUpdate(v)) => v.clone(),
+        _ => unreachable!(),
+    });
+    assert!(failed[0].contains("验证未通过"));
+}
+
+#[test]
+fn verification_incomplete_is_shown_as_not_done_not_as_defect() {
+    let v = match &verification_msg("inconclusive", 1, true, false).payload {
+        Some(visp_proto::visp::server_message::Payload::VerificationUpdate(v)) => v.clone(),
+        _ => unreachable!(),
+    };
+    let lines = format_verification_lines(&v);
+    assert!(lines[0].contains("验证未完成"));
+    assert!(lines[0].contains("不是发现缺陷"));
+}
+
+#[test]
+fn verification_events_render_in_main_tab() {
+    let mut app = AppState::new("sid".into(), "m".into(), "".into(), String::new());
+
+    app.route_frame(verification_msg("started", 1, false, false));
+    app.route_frame(verification_msg("passed", 1, true, true));
+
+    let tab = &app.tab_bar.tabs[0];
+    let verification_lines: Vec<&ChatLine> = tab
+        .messages
+        .iter()
+        .filter(|m| m.line_type == LineType::Verification)
+        .collect();
+    assert!(
+        verification_lines.len() >= 2,
+        "验证开始与结论都应出现在主对话区"
+    );
+    assert!(
+        verification_lines
+            .iter()
+            .any(|m| m.content.contains("验证通过"))
+    );
+    assert!(
+        tab.messages
+            .iter()
+            .any(|m| m.content.contains("10 万行 CSV")),
+        "结论附带的证据必须可见"
+    );
+}

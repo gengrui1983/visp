@@ -34,6 +34,26 @@ pub enum Outbound {
     FinishTurn(StopReason),
 }
 
+/// 本 turn 的最终验证状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    Passed,
+    /// 验证者完成了验证并发现了缺陷（或返工轮数用尽）。
+    Failed,
+    /// 验证者没做成验证（超时/步数用尽/未提交结论），不是代码缺陷。
+    Incomplete,
+}
+
+impl VerificationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerificationStatus::Passed => "passed",
+            VerificationStatus::Failed => "failed",
+            VerificationStatus::Incomplete => "incomplete",
+        }
+    }
+}
+
 /// 翻译上下文:归属主判据 + messageId 近似轮换状态(§7.3)。
 pub struct TranslateCtx {
     /// 在途父 prompt 的 visp session_id(归属与终止的唯一判据)
@@ -43,6 +63,8 @@ pub struct TranslateCtx {
     message_seq: u64,
     /// 上一个文本事件的来源 agent(变化 → 轮换 messageId)
     last_agent: Option<String>,
+    /// 本 turn 最终验证结论(None = 未触发验证)。
+    verification: Option<VerificationStatus>,
 }
 
 impl TranslateCtx {
@@ -52,7 +74,13 @@ impl TranslateCtx {
             message_id: MessageId::new("msg-0"),
             message_seq: 0,
             last_agent: None,
+            verification: None,
         }
+    }
+
+    /// 取出最终验证结论(在 Done 收尾时写入 PromptResponse 的 `_meta`)。
+    pub fn take_verification(&mut self) -> Option<VerificationStatus> {
+        self.verification.take()
     }
 
     /// 同一 agent 的连续文本保持同一 messageId;切换 agent 时轮换。
@@ -140,6 +168,22 @@ pub fn translate(msg: &ServerMessage, ctx: &mut TranslateCtx) -> Vec<Outbound> {
                 Outbound::FinishTurn(StopReason::Refusal),
             ]
         }
+        server_message::Payload::VerificationUpdate(v) => {
+            // 验证事件归属根会话发布;不按 session_id 抑制(即使在子会话中产生,
+            // 验证进度也必须对客户端可见)。最终结论记录到 TranslateCtx,
+            // 由 prompt_task 写入 PromptResponse._meta。
+            if v.is_final {
+                ctx.verification = Some(match v.stage.as_str() {
+                    "passed" => VerificationStatus::Passed,
+                    "inconclusive" => VerificationStatus::Incomplete,
+                    _ => VerificationStatus::Failed,
+                });
+            }
+            let mid = ctx.ensure_message_id(&v.agent_name);
+            vec![Outbound::Update(Box::new(
+                SessionUpdate::AgentMessageChunk(text_chunk(&format_verification(v), mid)),
+            ))]
+        }
         server_message::Payload::StatusUpdate(su) => {
             if su.session_id != ctx.parent_session_id {
                 return vec![];
@@ -155,6 +199,43 @@ pub fn translate(msg: &ServerMessage, ctx: &mut TranslateCtx) -> Vec<Outbound> {
 }
 
 // ===== 辅助构造(纯函数) =====
+
+/// 把结构化验证事件渲染为人类可读文本(ACP 无专用 session update 类型)。
+fn format_verification(v: &visp_proto::visp::VerificationUpdate) -> String {
+    let head = match v.stage.as_str() {
+        "started" => format!(
+            "🔍 独立验证开始:第 {} 轮(返工上限 {})",
+            v.round, v.max_rounds
+        ),
+        "passed" => format!("✅ 验证通过:{}", v.summary),
+        "failed" => {
+            if v.is_final {
+                format!("❌ 验证未通过:{}", v.summary)
+            } else {
+                format!("❌ 验证未通过(将继续返工):{}", v.summary)
+            }
+        }
+        "rework" => format!("↩ {}", v.summary),
+        "exhausted" => format!(
+            "❌ 验证未通过(已用尽 {} 轮返工):{}",
+            v.max_rounds, v.summary
+        ),
+        "inconclusive" => format!("⚠️ 验证未完成(验证没做成，不是发现缺陷):{}", v.summary),
+        other => format!("[验证 {}] {}", other, v.summary),
+    };
+    if v.evidence.is_empty() {
+        return head;
+    }
+    let mut out = head;
+    out.push_str("\n证据:");
+    for ev in &v.evidence {
+        out.push_str(&format!(
+            "\n- 检查:{} | 方法:{} | 结果:{}",
+            ev.check, ev.method, ev.result
+        ));
+    }
+    out
+}
 
 fn text_chunk(text: &str, message_id: MessageId) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text))).message_id(message_id)
@@ -592,6 +673,92 @@ mod tests {
         assert!(translate(&usage(), &mut c).is_empty());
         // 未知/新增 proto 变体安全抑制(通配分支)
         assert!(translate(&ServerMessage { payload: None }, &mut c).is_empty());
+    }
+
+    // ===== VerificationUpdate =====
+
+    fn verification(sid: &str, stage: &str, is_final: bool, passed: bool) -> ServerMessage {
+        msg(server_message::Payload::VerificationUpdate(
+            visp_proto::visp::VerificationUpdate {
+                stage: stage.into(),
+                round: 1,
+                max_rounds: 2,
+                summary: "核心场景已实际验证".into(),
+                evidence: vec![visp_proto::visp::VerificationEvidence {
+                    check: "10 万行 CSV 查询".into(),
+                    method: "构造大文件并执行".into(),
+                    result: "通过".into(),
+                }],
+                is_final,
+                passed,
+                session_id: sid.into(),
+                agent_name: "verifier".into(),
+            },
+        ))
+    }
+
+    fn chunk_text(out: &[Outbound]) -> String {
+        match &out[0] {
+            Outbound::Update(u) => match u.as_ref() {
+                SessionUpdate::AgentMessageChunk(c) => match &c.content {
+                    ContentBlock::Text(t) => t.text.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                },
+                other => panic!("expected AgentMessageChunk, got {other:?}"),
+            },
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verification_progress_and_final_pass_visible_to_client() {
+        let mut c = ctx();
+        let started = translate(&verification(PARENT, "started", false, false), &mut c);
+        assert_eq!(started.len(), 1);
+        assert!(chunk_text(&started).contains("独立验证开始"));
+        assert_eq!(c.take_verification(), None);
+
+        let passed = translate(&verification(PARENT, "passed", true, true), &mut c);
+        let text = chunk_text(&passed);
+        assert!(text.contains("验证通过"));
+        assert!(text.contains("10 万行 CSV 查询"), "ACP 文本必须带证据");
+        assert_eq!(c.take_verification(), Some(VerificationStatus::Passed));
+
+        // Done 收尾仍在,最终状态可由 prompt_task 写入 _meta。
+        let done_out = translate(&done(PARENT), &mut c);
+        assert!(matches!(
+            &done_out[0],
+            Outbound::FinishTurn(StopReason::EndTurn)
+        ));
+    }
+
+    #[test]
+    fn verification_final_failure_is_distinguishable() {
+        let mut c = ctx();
+        let exhausted = translate(&verification(PARENT, "exhausted", true, false), &mut c);
+        assert!(chunk_text(&exhausted).contains("验证未通过"));
+        assert_eq!(c.take_verification(), Some(VerificationStatus::Failed));
+    }
+
+    #[test]
+    fn verification_incomplete_is_not_reported_as_a_defect_verdict() {
+        let mut c = ctx();
+        let inconclusive = translate(&verification(PARENT, "inconclusive", true, false), &mut c);
+        let text = chunk_text(&inconclusive);
+        assert!(text.contains("验证未完成"));
+        assert!(text.contains("不是发现缺陷"));
+        assert_eq!(
+            c.take_verification(),
+            Some(VerificationStatus::Incomplete),
+            "没做成必须与发现缺陷区分，但都不能当作通过"
+        );
+    }
+
+    #[test]
+    fn verification_from_child_session_is_not_suppressed() {
+        let mut c = ctx();
+        let out = translate(&verification(CHILD, "started", false, false), &mut c);
+        assert_eq!(out.len(), 1, "验证进度即使来自子会话也必须可见");
     }
 
     // ===== StatusUpdate =====

@@ -216,7 +216,17 @@ async fn prompt_task(
                 if let Some(reason) = dispatch(msg, &state, &mut ctx, &acp_sid, &cx, &token).await?
                 {
                     state.registry.lock().await.end_prompt(&visp_sid);
-                    return responder.respond(PromptResponse::new(reason));
+                    let mut response = PromptResponse::new(reason);
+                    // 非交互入口的最终状态：验证未通过不能与普通成功混淆。
+                    if let Some(status) = ctx.take_verification() {
+                        let mut meta = agent_client_protocol::schema::v1::Meta::new();
+                        meta.insert(
+                            "visp.verification.status".to_string(),
+                            serde_json::Value::String(status.as_str().to_string()),
+                        );
+                        response = response.meta(meta);
+                    }
+                    return responder.respond(response);
                 }
             }
             Ok(None) => {

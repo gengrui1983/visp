@@ -106,6 +106,79 @@ fn default_call_endpoint() -> String {
     "/call".to_string()
 }
 
+/// 独立验证器配置（daemon.toml 中的 [verifier] section）。
+///
+/// 所有字段均为 `Option`：项目级配置只覆盖显式写出的字段，未写字段继承全局值。
+/// 下文的 `is_enabled` / `effective_*` 返回的是产品行为默认值，而非 serde 默认值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VerifierSection {
+    /// 是否启用独立验证（默认开启）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// 验证不通过时的最大返工轮数（默认 2）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    /// 验证器使用的模型（默认继承主 agent 模型）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 单次验证超时秒数（默认 600）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// 验证器单次运行的最大步数（默认 40）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+}
+
+impl VerifierSection {
+    /// 所有字段均未显式配置时视为空段，序列化时整体省略。
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.max_rounds.is_none()
+            && self.model.is_none()
+            && self.timeout_secs.is_none()
+            && self.max_steps.is_none()
+    }
+
+    /// 是否启用独立验证。默认开启属于产品行为，不写入配置文件。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// 生效的最大返工轮数。默认 2 轮属于产品行为，不写入配置文件。
+    pub fn effective_max_rounds(&self) -> u32 {
+        self.max_rounds.unwrap_or(2)
+    }
+
+    /// 生效的验证超时秒数。默认 600 秒属于产品行为，不写入配置文件。
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(600)
+    }
+
+    /// 生效的验证最大步数。默认 40 步属于产品行为，不写入配置文件。
+    pub fn effective_max_steps(&self) -> u32 {
+        self.max_steps.unwrap_or(40)
+    }
+}
+
+/// 将项目级 verifier 配置合并到全局配置：仅覆盖项目显式写出的字段。
+pub(crate) fn merge_verifier_sections(global: &mut VerifierSection, project: &VerifierSection) {
+    if project.enabled.is_some() {
+        global.enabled = project.enabled;
+    }
+    if project.max_rounds.is_some() {
+        global.max_rounds = project.max_rounds;
+    }
+    if project.model.is_some() {
+        global.model = project.model.clone();
+    }
+    if project.timeout_secs.is_some() {
+        global.timeout_secs = project.timeout_secs;
+    }
+    if project.max_steps.is_some() {
+        global.max_steps = project.max_steps;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_daemon_section")]
@@ -137,6 +210,9 @@ pub struct DaemonConfig {
         skip_serializing_if = "HooksConfig::is_empty"
     )]
     pub hooks: HooksConfig,
+    /// 独立验证配置（空段不写入配置文件）。
+    #[serde(default, skip_serializing_if = "VerifierSection::is_empty")]
+    pub verifier: VerifierSection,
 }
 
 impl Default for DaemonConfig {
@@ -152,6 +228,7 @@ impl Default for DaemonConfig {
             storage: StorageSection::default(),
             observability: ObservabilityConfig::default(),
             hooks: HooksConfig::default(),
+            verifier: VerifierSection::default(),
         }
     }
 }
@@ -890,6 +967,7 @@ pub fn load_config(config_path: Option<&Path>) -> Result<DaemonConfig, String> {
                 merge_llm_sections(&mut config.llm, &project_config.llm);
                 merge_agent_builtins(&mut config.agent.builtin, &project_config.agent.builtin);
                 merge_hooks(&mut config.hooks, &project_config.hooks);
+                merge_verifier_sections(&mut config.verifier, &project_config.verifier);
             }
             Err(e) => {
                 tracing::warn!(path = %project_path.display(), error = %e, "failed to load project config, ignoring");
@@ -1089,6 +1167,7 @@ fn default_config() -> DaemonConfig {
         },
         observability: ObservabilityConfig::default(),
         hooks: HooksConfig::default(),
+        verifier: VerifierSection::default(),
     }
 }
 
@@ -4515,3 +4594,7 @@ mod tests_daemon_filewatcher {
         assert_eq!(config.daemon.log_level, default_log_level());
     }
 }
+
+#[cfg(test)]
+#[path = "config_verifier_tests.rs"]
+mod verifier_tests;

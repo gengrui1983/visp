@@ -584,7 +584,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(config.clone()),
         providers,
         bus.clone(),
-    );
+    )
+    .with_verifier_config(visp_agent::verifier::VerifierConfig {
+        enabled: config.verifier.is_enabled(),
+        max_rounds: config.verifier.effective_max_rounds(),
+        model: config.verifier.model.clone(),
+        timeout_secs: config.verifier.effective_timeout_secs(),
+        max_steps: config.verifier.effective_max_steps(),
+    });
     tokio::spawn(async move {
         orchestrator.run().await;
     });
