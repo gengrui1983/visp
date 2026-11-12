@@ -348,14 +348,14 @@ async fn run_once(cli: &Cli, approve: bool, words: &[String]) -> i32 {
             .await;
             eprintln!(
                 "[visp run] {:?} in {:.0}s: {} tool calls, approvals {} granted / {} denied, \
-             tokens (all agents) in {} / out {}",
+             main agent last call: tokens in {} / out {}",
                 outcome,
                 started.elapsed().as_secs_f64(),
                 stats.tool_calls,
                 stats.approvals_granted,
                 stats.approvals_denied,
-                stats.input_tokens,
-                stats.output_tokens
+                stats.last_input_tokens,
+                stats.last_output_tokens
             );
             Ok::<_, String>(outcome)
         }

@@ -65,8 +65,11 @@ pub struct RunStats {
     pub tool_calls: u32,
     pub approvals_granted: u32,
     pub approvals_denied: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// Input/output tokens of the main agent's last LLM call, as reported by
+    /// the daemon's `UsageInfo` (sent once per finished turn; it is the last
+    /// call's usage, not a running total). Input ≈ context size at the end.
+    pub last_input_tokens: u32,
+    pub last_output_tokens: u32,
 }
 
 /// Build the `UserInput` message that starts the turn.
@@ -225,10 +228,10 @@ pub async fn drive<O: Write, E: Write>(
                     let _ = writeln!(err, "[status] {}", one_line(&su.message, 200));
                 }
             }
-            server_message::Payload::UsageInfo(u) => {
-                // All sessions: sub-agents spend tokens too.
-                stats.input_tokens += u64::from(u.input_tokens);
-                stats.output_tokens += u64::from(u.output_tokens);
+            server_message::Payload::UsageInfo(u) if u.session_id == session_id => {
+                // Not cumulative: the daemon reports the last call of the turn.
+                stats.last_input_tokens = u.input_tokens;
+                stats.last_output_tokens = u.output_tokens;
             }
             server_message::Payload::Done(d) => {
                 if d.session_id == session_id {
@@ -485,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_is_summed_over_all_agents() {
+    async fn usage_reports_the_main_agents_last_call_not_a_sum() {
         let usage = |sid: &str, i: u32, o: u32| {
             msg(server_message::Payload::UsageInfo(
                 visp_proto::visp::UsageInfo {
@@ -500,12 +503,16 @@ mod tests {
             vec![
                 usage("parent", 100, 10),
                 usage("child-1", 50, 5),
+                usage("parent", 300, 30),
                 done("parent"),
             ],
             false,
         )
         .await;
-        assert_eq!((stats.input_tokens, stats.output_tokens), (150, 15));
+        assert_eq!(
+            (stats.last_input_tokens, stats.last_output_tokens),
+            (300, 30)
+        );
     }
 
     #[test]
